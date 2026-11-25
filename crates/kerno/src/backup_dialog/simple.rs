@@ -812,6 +812,69 @@ impl BackupDialog {
         text
     }
 
+    /// A backup taken from another database than the one restored into, and
+    /// its statements that name that database (K78): what they would do, and
+    /// what Kerno does with them, said before the run. A plain dump: from
+    /// its first lines only (the database its header names, or selects with
+    /// `USE`).
+    pub(super) fn source_words(&self) -> Option<String> {
+        if self.mode != Mode::Restore || self.family != ClientFamily::MySql {
+            return None;
+        }
+        let Some(Ok(input)) = &self.input else {
+            return None;
+        };
+        let target = &self.database;
+        if input.manifest.is_some() {
+            let source = input.archive_database.as_deref()?;
+            return (source != target)
+                .then(|| {
+                    mysql_folder::naming_said(
+                        &input.naming,
+                        source,
+                        target,
+                        self.restore.load_as_written,
+                        false,
+                    )
+                })
+                .flatten();
+        }
+        if let Some(uses) = input.dump_uses.as_deref().filter(|uses| *uses != target) {
+            return Some(format!(
+                "This dump selects the database “{uses}” itself (USE `{uses}`): restored, what it \
+                 holds goes into “{uses}”, not into “{target}”."
+            ));
+        }
+        let source = input
+            .archive_database
+            .as_deref()
+            .filter(|source| *source != target)?;
+        Some(format!(
+            "This dump was taken from the database “{source}”: its triggers, routines, events or \
+             views that name “{source}” would act on “{source}”, not on “{target}”. Kerno reads \
+             only the start of a dump, not every statement, so it cannot say which do."
+        ))
+    }
+
+    /// Whether the folder backup holds statements that would write into the
+    /// database it was taken from, which the restore leaves out unless
+    /// "Load them as written" is ticked (K78).
+    pub(super) fn source_writes(&self) -> bool {
+        match &self.input {
+            Some(Ok(Input {
+                manifest: Some(_),
+                archive_database: Some(source),
+                naming,
+                ..
+            })) => {
+                self.mode == Mode::Restore
+                    && *source != self.database
+                    && naming.iter().any(mysql_folder::FileNaming::writes)
+            }
+            _ => false,
+        }
+    }
+
     /// The client in use, small, with the way to another one.
     fn simple_client(&self, cx: &Context<Self>) -> AnyElement {
         h_flex()
@@ -1208,7 +1271,8 @@ impl BackupDialog {
                             ),
                     )
                     .children(read)
-                    .children(self.render_preflight(cx)),
+                    .children(self.render_preflight(cx))
+                    .children(self.render_source(cx)),
                 cx,
             ),
             row(

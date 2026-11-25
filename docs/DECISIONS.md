@@ -4492,6 +4492,72 @@ and `tools::run` aborted it and returned the child's exit 0. The test was right;
   written everything but has not returned yet would fail a good restore on a loaded machine. Waiting without a
   bound: a grandchild of the client holding its input open would hold the run.
 
+## D-145 — A backup that names its own database writes nothing there unless asked (K78; 2026-11-25)
+
+The pass in the real app of 2026-11-25 restored a MariaDB folder backup (K63) into another database. A trigger
+had been created with its database written out (`create trigger src.big_bi … on src.big …`); MariaDB keeps a
+trigger's text as typed, and mysqldump wrote it so into `routines.sql`. The restore into “dst” ran `CREATE
+TRIGGER src.big_bi` against the source, and failed only because the source still held it (ERROR 1359); the
+views were then not loaded, and "Run the restore again" failed the same way each time.
+
+- **Reproduced first.** `kerno-mysql/tests/folder_backup.rs`
+  `a_backup_that_names_its_database_restores_nothing_into_it_by_default`, with the source's triggers dropped
+  after the backup (so that no "already exists" hides the harm): on the base, the MariaDB restore into another
+  database created both triggers in the source and ended "Done". MySQL 8.4 rewrites a trigger's header without
+  its database (checked on the fixtures): there only bodies name the source.
+- **What the manifest knows.** It names the database the backup was taken from (`Manifest::database`, written
+  since K63): the restore compares it with the target, byte for byte (a name that differs only by case is
+  another database on a server that tells case apart).
+- **Read, not guessed.** `mysql_folder::find_naming` reads `routines.sql` and `views.sql` (64 MiB at most each,
+  off the UI thread: in the wizard's `examine`, and again in `restore` before any client starts, so a task or
+  a stale wizard never runs on an old reading) with K74's quote tracker, which now says what each byte is part
+  of (`Quoted::walk`; `find_definition` uses it unchanged): statements are split as the mysql client splits
+  them (quotes, comments, `DELIMITER` lines; `/*!…*/` is code), and in each the qualifier `src.` or
+  `` `src`. `` is found in code and quoted names only. A statement whose own name (or a trigger's `ON` table) is
+  qualified with the source, a `DROP` or `ALTER` of one, or `ALTER DATABASE src` (mysqldump writes it around a
+  routine whose collation differs) would write into the source at the restore; a statement whose body alone
+  names it acts on the source each time it runs. Names compare without case (the careful side: a false hit only
+  leaves out a statement Kerno then names; a miss would write into the source).
+- **Leaving out per statement, where safe.** Each statement that would write into the source is left out by its
+  bytes, the client fed the rest of the file (`StdinPart` ranges, no temporary file, the user's SQL never
+  rewritten), when it stands alone on its lines: its first line starts with it and its delimiter ends its last
+  line (mysqldump writes each trigger, routine and event so, between `DELIMITER ;;` and `DELIMITER ;`, whose
+  lines stay). Otherwise the whole file is left out, and said: a statement sharing its lines; a statement naming
+  the source of a kind Kerno does not know (not CREATE / DROP / ALTER of a trigger, routine, event, view or
+  database); any such statement in `views.sql` (mysqldump first writes a stand-in for each view, which would
+  stay); a file that could not be read. The left-out bytes count as sent, so the progress still reaches its
+  total.
+- **Said, the safe way by default.** Before Start (the simple view, the wizard, the confirmation), one block:
+  how many of each kind, the first three names, what they would do ("restored into “dst” as they are, they
+  would be created in “src”, not in “dst”"), that Kerno leaves them out unless "Load them as written (they act
+  on “src”)" is ticked, and how to have them (edit `routines.sql` and run it in “dst”, or restore into a
+  database named “src”). The choice (`RestoreOptions::load_as_written`) is asked at each run, never kept in a
+  task, reset for each file, and said in the confirmation; production and read-only go through the same
+  confirmation as every restore. The end of the run names what was left out and why, or what was loaded into
+  the source as written; bodies that only name the source are loaded and said once before and once at the end.
+  After a stop, only the left-out part is said (what was to load as written may not have run).
+- **The plain one-file restore** reads its first 4 KB already (K63's utf8mb4 check): the header comment
+  `-- Host: … Database: src` names the database, and a `USE \`src\`;` there (`mysqldump --databases`) the one it
+  selects. When either differs from the target, the wizard says so before the run, without counts: naming the
+  statements means reading the whole file, minutes for a large dump. A dump made with `--skip-comments` has no
+  header: nothing is said.
+- **A failure after the tables** (every table and its rows in, the routines or the views failed) says so, at
+  the line of the file itself (the left-out lines added back), names the statement there when it is one that
+  names the source (MySQL 8.4's ERROR 1359 names no database; MariaDB's does, and its words are read too),
+  says that a statement that creates what already exists stops a rerun at the same point, and that the rest can
+  be run by itself once mended; never "Run the restore again" alone. A stop before the views says which of the
+  backup's views the database already held (read with the tables after the stop): left as they were.
+- **Two small things of the dialog.** "Save as task…" and "Save task" are disabled, with a tooltip saying why,
+  whenever the settings could not be saved (they already refused on click with a notification); a folder
+  restore's refused arguments now count among those reasons, as a saved task with them could never start. The
+  run's log is a list of variable height (`ListState`) so that a long line wraps inside the box.
+- **Limits.** A database named like one of the backup's tables or views makes `src.x` ambiguous (a database's
+  table or a table's column): there a body counts only when `x` is one of the backup's tables or views, or the
+  name has three parts; a column named like a table, or an alias named like the database, can still be taken for
+  one (a body only: it is loaded either way, and the words may say one too many). A routine created under
+  `ANSI_QUOTES` reads `"src".t` as a string here, as the client does. Only MariaDB 11 and MySQL 8.4 files written
+  by mysqldump 26.10 were tried; `mariadb-dump`'s own files and the legacy servers were not.
+
 ## D-144 — A connection opened again is a new tree; a lost tree read is read once more (K75; 2026-11-25)
 
 The real-app pass of 2026-11-25 found the schema tree failing every read with "connection closed: the session

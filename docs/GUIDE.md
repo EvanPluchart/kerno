@@ -710,6 +710,23 @@ The wizard reads the database's tables again after each run, so a second restore
 what the first one left. For a plain SQL dump, the wizard says that a dump with DROP TABLE statements replaces
 its tables in a database that is not empty, without naming them (that would mean reading the whole file first).
 
+A backup restored into another database than the one it was taken from can hold statements written for that
+first database: a trigger created as `CREATE TRIGGER shop.audit_bi …` from a tab on another database keeps its
+database's name on MariaDB, and a routine, an event, a trigger or a view may name `shop.orders` in its body.
+Before Start, the restore says how many of each kind name it and what they would do: restored into
+“shop_copy” as they are, the first kind would be created in “shop”, not in “shop_copy”, and Kerno leaves those
+statements out unless you tick **Load them as written (they act on “shop”)**; the tables, their rows and
+everything else are loaded, and the end of the run names what was left out and how to get it (edit
+`routines.sql` and run it in “shop_copy”, or restore into a database named “shop”). A statement that only names
+“shop” in its body is loaded either way and said once before the run and at its end: it acts on “shop” each
+time it runs. The confirmation says the same, the choice included. Kerno reads `routines.sql` and `views.sql` for
+this, strings and comments left aside; a statement it cannot leave out alone (one that shares its lines with
+another, or a view) leaves its whole file out, and says so. A plain SQL dump is read only for its first lines:
+the restore says which database it was taken from, or the database it selects itself (`USE`), when that is
+not the one chosen. A routines or views file that fails once every table is in says that the tables and their
+rows are in place, and what a rerun would do, rather than "run it again"; the backup's views a database
+already held are said to be left as they were when the restore stopped before them.
+
 MySQL and MariaDB tools talk `utf8mb4` with a server that has it (5.5.3 on): a MySQL 5.7 client no longer
 writes a 4-byte character (an emoji) as `?`, in the plain backup as in the folder. Such a backup starts with
 `SET NAMES utf8mb4`, which a server before 5.5.3 refuses (ERROR 1115): restoring it into MySQL 5.1, the wizard

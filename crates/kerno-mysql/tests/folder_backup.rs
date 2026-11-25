@@ -5,9 +5,10 @@
 //! a cancel that leaves no tool, no folder and no lock. On MySQL 8.4,
 //! MariaDB 11 and the legacy servers that are up (5.1 to 5.7, with a MySQL
 //! 5.7 client: the newer ones cannot read 5.1). K74: a folder restored again
-//! into a database that holds its tables. Every scratch database is
-//! `kerno_test_k63_*` or `kerno_test_k74_*`, dropped also when the test
-//! fails.
+//! into a database that holds its tables. K78: a backup whose triggers,
+//! routines or views name their database, restored into another one. Every
+//! scratch database is `kerno_test_k63_*`, `kerno_test_k74_*` or
+//! `kerno_test_k78_*`, dropped also when the test fails.
 
 mod common;
 
@@ -48,6 +49,8 @@ const AGAIN_SOURCE: &str = "kerno_test_k74_src";
 const AGAIN_TARGET: &str = "kerno_test_k74_dst";
 const NEWLINE_SOURCE: &str = "kerno_test_k74_nl_src";
 const NEWLINE_TARGET: &str = "kerno_test_k74_nl_dst";
+const NAMED_SOURCE: &str = "kerno_test_k78_src";
+const NAMED_TARGET: &str = "kerno_test_k78_dst";
 
 /// One test of this file at a time: a test that holds the server's read
 /// lock would make the others' writes wait.
@@ -2304,5 +2307,239 @@ async fn newline_names(server: &'static Server, client: PathBuf) {
             .iter()
             .any(|line| line.starts_with("Kerno: 1 of the tables' first files run whole"));
         assert_eq!(alone, run == 2, "{}: run {run}", server.label);
+    }
+}
+
+/// K78: the pass's shape, written from another database's tab with the
+/// source's name: a trigger whose header names it (MariaDB keeps it as
+/// typed), one whose body writes into it, a procedure and an event whose
+/// bodies name it, a function that names it only in a string and a
+/// comment, a view. Restored into another database: by default nothing is
+/// created or changed in the source (its triggers, routines, events and
+/// views compared before and after), the tables are loaded, the left-out
+/// objects named; with "load them as written", what the statements say.
+#[tokio::test]
+async fn a_backup_that_names_its_database_restores_nothing_into_it_by_default() {
+    let _serial = SERIAL.lock().await;
+    let Some((servers, client)) = servers() else {
+        return;
+    };
+    for server in servers {
+        if !matches!(server.label.as_str(), "MySQL" | "MariaDB") {
+            continue;
+        }
+        let server: &'static Server = Box::leak(Box::new(server));
+        with_scratch(
+            &server.params,
+            &[NAMED_SOURCE, NAMED_TARGET],
+            named_source(server, client.clone()),
+        )
+        .await;
+    }
+}
+
+/// The objects of `db` that are not tables, with their definitions.
+async fn objects_of(admin: &Arc<dyn Session>, db: &str) -> Vec<Vec<Option<String>>> {
+    let mut all = Vec::new();
+    for sql in [
+        format!(
+            "SELECT TRIGGER_NAME, ACTION_STATEMENT FROM information_schema.TRIGGERS \
+             WHERE TRIGGER_SCHEMA = '{db}' ORDER BY 1"
+        ),
+        format!(
+            "SELECT ROUTINE_NAME, ROUTINE_DEFINITION FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = '{db}' ORDER BY 1"
+        ),
+        format!(
+            "SELECT EVENT_NAME, EVENT_DEFINITION FROM information_schema.EVENTS \
+             WHERE EVENT_SCHEMA = '{db}' ORDER BY 1"
+        ),
+        format!(
+            "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = '{db}' ORDER BY 1"
+        ),
+    ] {
+        all.extend(rows(admin, &sql).await);
+    }
+    all
+}
+
+async fn named_source(server: &'static Server, client: PathBuf) {
+    let (src, dst) = (NAMED_SOURCE, NAMED_TARGET);
+    // Kerno's own session, in no database: names written out, as from a
+    // tab on another database.
+    let admin = session(&server.params, None).await;
+    for db in [src, dst] {
+        exec_ok(&admin, &format!("CREATE DATABASE {db}")).await;
+    }
+    for sql in [
+        format!("CREATE TABLE {src}.big (id INT NOT NULL PRIMARY KEY, n INT) ENGINE=InnoDB"),
+        format!(
+            "CREATE TABLE {src}.audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             note VARCHAR(200)) ENGINE=InnoDB"
+        ),
+        format!(
+            "create trigger {src}.big_bi before insert on {src}.big for each row \
+             set new.n = new.id * 2"
+        ),
+        format!(
+            "CREATE TRIGGER {src}.big_ai AFTER INSERT ON {src}.big FOR EACH ROW \
+             INSERT INTO {src}.audit (note) VALUES (CONCAT('{src}.big ', NEW.id))"
+        ),
+        format!(
+            "CREATE PROCEDURE {src}.count_big(OUT c INT) READS SQL DATA \
+             SELECT COUNT(*) INTO c FROM {src}.big"
+        ),
+        format!(
+            "CREATE FUNCTION {src}.quiet() RETURNS VARCHAR(100) DETERMINISTIC NO SQL \
+             RETURN '{src}.big is not a hit' /* {src}.big */"
+        ),
+        format!(
+            "CREATE EVENT {src}.nightly ON SCHEDULE EVERY 1 DAY DISABLE \
+             DO DELETE FROM {src}.audit WHERE id < 0"
+        ),
+        format!("CREATE VIEW {src}.big_v AS SELECT id, n FROM {src}.big"),
+        format!("INSERT INTO {src}.big (id) VALUES (1), (2), (3)"),
+    ] {
+        exec_ok(&admin, &sql).await;
+    }
+    let server_version = admin.server().version_number;
+    let files = tempfile::tempdir().unwrap();
+    let folder = files.path().join("backup");
+    let (on_line, _) = sink();
+    let mut options = folder_options(src, 2, DumpMethod::SingleTransaction);
+    options.utf8mb4 = tools::utf8mb4(server.dump_version.as_ref(), server_version);
+    mysql_folder::back_up(
+        FolderBackup {
+            tool_path: server.dump.clone(),
+            params: server.params.clone(),
+            options,
+            folder: folder.clone(),
+            client: server.dump_version.clone(),
+            range_threshold: mysql_folder::RANGE_THRESHOLD,
+        },
+        admin.clone(),
+        on_line,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .outcome
+    .unwrap_or_else(|error| panic!("{}: the backup failed: {error}", server.label));
+    let manifest = mysql_folder::read_manifest(&folder).unwrap();
+    // The source without its triggers: a restore that creates one there is
+    // seen, not hidden by "already exists" (the pass's ERROR 1359).
+    for trigger in ["big_bi", "big_ai"] {
+        exec_ok(&admin, &format!("DROP TRIGGER {src}.{trigger}")).await;
+    }
+    let before = objects_of(&admin, src).await;
+    let count = |db: &'static str, table: &'static str| {
+        let admin = admin.clone();
+        async move { rows(&admin, &format!("SELECT COUNT(*) FROM {db}.{table}")).await }
+    };
+    let (big, audit) = (count(src, "big").await, count(src, "audit").await);
+
+    let restore = |load_as_written: bool| {
+        let (on_line, lines) = sink();
+        let job = FolderRestore {
+            tool_path: client.clone(),
+            params: server.params.clone(),
+            options: RestoreOptions {
+                tool_version: tools::version(&client),
+                jobs: Some(2),
+                utf8mb4: tools::utf8mb4(tools::version(&client).as_ref(), server_version),
+                load_as_written,
+                ..RestoreOptions::new(Engine::MySql, dst, &folder, BackupFormat::Directory)
+            },
+            manifest: manifest.clone(),
+            sent: Arc::default(),
+        };
+        let (total, sent) = (job.total(), job.sent.clone());
+        async move {
+            let end = mysql_folder::restore(job, on_line, Arc::new(AtomicBool::new(false))).await;
+            // Every byte counted, the left-out ones too (K74, L3).
+            assert_eq!(sent.load(Ordering::Relaxed), total);
+            let log = lines.lock().unwrap().join("\n");
+            (end, log)
+        }
+    };
+    let names = |db: &'static str, kind: &'static str| {
+        let admin = admin.clone();
+        let sql = match kind {
+            "trigger" => format!(
+                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = \
+                 '{db}' ORDER BY 1"
+            ),
+            _ => format!(
+                "SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = \
+                 '{db}' ORDER BY 1"
+            ),
+        };
+        async move {
+            rows(&admin, &sql)
+                .await
+                .into_iter()
+                .filter_map(|row| row[0].clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    let mariadb = server.label == "MariaDB";
+    let (end, log) = restore(false).await;
+    end.outcome
+        .unwrap_or_else(|error| panic!("{}: the restore failed: {error}", server.label));
+    let said = end.said.unwrap_or_default();
+    eprintln!("{}: {said}", server.label);
+    assert_eq!(
+        objects_of(&admin, src).await,
+        before,
+        "{}: the source changed: {log}",
+        server.label
+    );
+    assert_eq!(count(dst, "big").await, big, "{}", server.label);
+    assert_eq!(count(dst, "audit").await, audit, "{}", server.label);
+    // The routines and the view are in the target; the triggers MariaDB
+    // kept written for the source are left out and named.
+    assert_eq!(
+        names(dst, "routine").await,
+        ["count_big", "quiet"],
+        "{}",
+        server.label
+    );
+    if mariadb {
+        assert!(names(dst, "trigger").await.is_empty(), "{log}");
+        assert!(
+            said.starts_with(
+                "Left out: 2 triggers (“big_bi”, “big_ai”), written for the database \
+                 “kerno_test_k78_src”"
+            ),
+            "{said}"
+        );
+    } else {
+        // MySQL rewrites a trigger's header: only `big_ai`'s body names
+        // the source, and it is loaded.
+        assert_eq!(names(dst, "trigger").await, ["big_ai", "big_bi"]);
+        assert!(!said.contains("Left out"), "{said}");
+    }
+    assert!(
+        said.contains("(“big_ai”, “nightly”, “count_big”) read or write “kerno_test_k78_src”")
+            || said.contains("(“nightly”, “count_big”) read or write “kerno_test_k78_src”"),
+        "{said}"
+    );
+    assert!(!said.contains("“quiet”"), "{said}");
+
+    // Loaded as written: what the statements say happens, the triggers
+    // created in the source.
+    let (end, log) = restore(true).await;
+    end.outcome
+        .unwrap_or_else(|error| panic!("{}: as written: {error}: {log}", server.label));
+    if mariadb {
+        assert_eq!(names(src, "trigger").await, ["big_ai", "big_bi"]);
+        assert!(names(dst, "trigger").await.is_empty());
+        assert!(
+            end.said
+                .unwrap_or_default()
+                .starts_with("Loaded as written, into “kerno_test_k78_src”: 2 triggers")
+        );
+    } else {
+        assert_eq!(objects_of(&admin, src).await, before, "{}", server.label);
     }
 }

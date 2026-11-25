@@ -750,7 +750,8 @@ pub struct FolderEnd {
     /// A backup's folder this run made was removed.
     pub removed: bool,
     /// A cancelled restore: what it left, as the database holds it (K74,
-    /// F3).
+    /// F3). A restore that ended well: what it left out, or loaded into the
+    /// backup's own database, of the statements that name it (K78).
     pub said: Option<String>,
 }
 
@@ -2022,57 +2023,73 @@ impl Quoted {
     /// The state after `line`, starting in `self`. mysqldump writes the
     /// newlines of a string as `\n` but an identifier's raw: a table or
     /// column name may hold a newline and anything after it (K74, F2).
-    fn after(mut self, line: &[u8]) -> Self {
+    fn after(self, line: &[u8]) -> Self {
+        self.walk(line, |_, _| {})
+    }
+
+    /// [`Quoted::after`], telling `each` what every byte of `line` is part
+    /// of: code, a quoted name (its backticks too), a string (its quotes
+    /// too) or a comment (its marks too; a `#` or `-- ` comment runs to the
+    /// end of the line). The one quote tracker of the folder restore (K74,
+    /// K78).
+    fn walk(mut self, line: &[u8], mut each: impl FnMut(usize, Quoted)) -> Self {
         let mut at = 0;
         while at < line.len() {
             let (byte, next) = (line[at], line.get(at + 1).copied());
+            // The byte's own part, and how many bytes it covers.
+            let (mut part, mut width) = (self, 1);
             match self {
                 Quoted::Code => match byte {
-                    b'`' => self = Quoted::Backtick,
-                    b'\'' => self = Quoted::Single,
-                    b'"' => self = Quoted::Double,
-                    b'#' => return self,
+                    b'`' => (self, part) = (Quoted::Backtick, Quoted::Backtick),
+                    b'\'' => (self, part) = (Quoted::Single, Quoted::Single),
+                    b'"' => (self, part) = (Quoted::Double, Quoted::Double),
+                    b'#' => width = line.len() - at,
                     b'-' if next == Some(b'-')
                         && line
                             .get(at + 2)
                             .is_none_or(|after| after.is_ascii_whitespace()) =>
                     {
-                        return self;
+                        width = line.len() - at;
                     }
                     // `/*!…*/` and `/*+…*/` are code the server runs.
                     b'/' if next == Some(b'*')
                         && !matches!(line.get(at + 2), Some(b'!') | Some(b'+')) =>
                     {
-                        self = Quoted::Comment;
-                        at += 1;
+                        (self, part, width) = (Quoted::Comment, Quoted::Comment, 2);
                     }
                     _ => {}
                 },
                 Quoted::Backtick if byte == b'`' => {
                     if next == Some(b'`') {
-                        at += 1;
+                        width = 2;
                     } else {
                         self = Quoted::Code;
                     }
                 }
-                Quoted::Single | Quoted::Double if byte == b'\\' => at += 1,
+                Quoted::Single | Quoted::Double if byte == b'\\' => width = 2,
                 Quoted::Single | Quoted::Double => {
                     let quote = if self == Quoted::Single { b'\'' } else { b'"' };
                     if byte == quote {
                         if next == Some(quote) {
-                            at += 1;
+                            width = 2;
                         } else {
                             self = Quoted::Code;
                         }
                     }
                 }
                 Quoted::Comment if byte == b'*' && next == Some(b'/') => {
-                    self = Quoted::Code;
-                    at += 1;
+                    (self, width) = (Quoted::Code, 2);
                 }
                 Quoted::Backtick | Quoted::Comment => {}
             }
-            at += 1;
+            // A comment to the end of the line: its bytes are comment, the
+            // next line starts in code.
+            if self == Quoted::Code && part == Quoted::Code && width > 1 {
+                part = Quoted::Comment;
+            }
+            let end = (at + width).min(line.len());
+            (at..end).for_each(|byte| each(byte, part));
+            at = end;
         }
         self
     }
@@ -2137,6 +2154,625 @@ pub fn find_definition(path: &Path) -> std::io::Result<Option<Definition>> {
     Ok(None)
 }
 
+/// A statement of `routines.sql` or `views.sql` that names the database the
+/// backup was taken from as a qualifier (`src.x`, `` `src`.`x` ``), outside
+/// strings and comments (K78).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Naming {
+    /// What it creates, drops or alters: `trigger`, `procedure`,
+    /// `function`, `event`, `view`, `database`; `statement` when Kerno does
+    /// not know its kind.
+    pub kind: &'static str,
+    /// Its name, without the database.
+    pub name: String,
+    /// The statement itself creates, drops or alters something in the
+    /// source (its name, or a trigger's table, is qualified with it; or the
+    /// kind is not known): it would write into the source at the restore.
+    /// Otherwise only its body names the source: it acts on the source each
+    /// time it runs.
+    pub creates: bool,
+    /// Its bytes in the file, from the start of its first line to the end
+    /// of the line its delimiter ends.
+    pub range: std::ops::Range<u64>,
+    /// The same lines, numbered from 1, the end excluded.
+    pub lines: std::ops::Range<u64>,
+}
+
+/// What [`naming`] found in one file after the tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileNaming {
+    pub file: String,
+    pub kind: AfterKind,
+    pub found: Vec<Naming>,
+    /// Why the statements that would write into the source cannot be left
+    /// out one by one, so that the whole file is: one is not alone on its
+    /// lines, or of a kind Kerno does not know, or a view (mysqldump
+    /// creates a stand-in first, which would stay), or the file could not
+    /// be read.
+    pub whole: Option<String>,
+}
+
+impl FileNaming {
+    /// Whether the restore leaves something of it out unless told to load
+    /// it as written.
+    pub fn writes(&self) -> bool {
+        self.whole.is_some() || self.found.iter().any(|named| named.creates)
+    }
+}
+
+/// How much of a file after the tables Kerno reads to find the source's
+/// name: they hold no rows.
+const NAMING_WITHIN: u64 = 64 << 20;
+
+/// The statements of `text` (a file after the tables) that name `source`
+/// as a qualifier, outside strings and comments, read with the client's own
+/// rules: `DELIMITER` lines, quotes, comments, `/*!…*/` as code. `local`:
+/// the backup's tables and views; where one is named like the database,
+/// `src.x` in a body counts only when `x` is one of them too (a three-part
+/// `src.t.c` always). Names compare without case. Also why the file can
+/// only be left out whole, if it can.
+pub fn find_naming(text: &[u8], source: &str, local: &[String]) -> (Vec<Naming>, Option<String>) {
+    // What each byte is part of, with the tracker of K74.
+    let mut part = vec![Quoted::Code; text.len()];
+    let mut state = Quoted::Code;
+    let mut line_starts = vec![(0usize, Quoted::Code)];
+    let mut at = 0;
+    for line in text.split_inclusive(|byte| *byte == b'\n') {
+        state = state.walk(line, |byte, what| part[at + byte] = what);
+        at += line.len();
+        line_starts.push((at, state));
+    }
+    line_starts.pop();
+    let statements = split_statements(text, &part, &line_starts);
+    let same = |word: &str| word.eq_ignore_ascii_case(source);
+    let clash = local.iter().any(|name| same(name));
+    let known = |word: &str| local.iter().any(|name| name.eq_ignore_ascii_case(word));
+    let mut found = Vec::new();
+    let mut whole = None;
+    for (start, end) in statements {
+        let tokens = tokens(&text[start..end], &part[start..end]);
+        let head = head(&tokens);
+        let at_head = |index: usize| {
+            head.as_ref()
+                .is_some_and(|head| head.names.contains(&index))
+        };
+        let mut creates = head.as_ref().is_some_and(|head| {
+            head.names
+                .iter()
+                .any(|&index| qualified_by(&tokens, index, &same))
+                // `ALTER DATABASE src …` (mysqldump writes it around a
+                // routine whose collation is not its database's).
+                || (head.kind == "database"
+                    && head.names.iter().any(|&index| same(&tokens[index].text)))
+        });
+        let dot = |index: usize| tokens.get(index).is_some_and(|token| token.is("."));
+        let mut body = false;
+        for index in 0..tokens.len() {
+            // `x.src.y`: `src` is a table there.
+            if at_head(index + 2)
+                || !same(&tokens[index].text)
+                || !dot(index + 1)
+                || (index > 0 && dot(index - 1))
+            {
+                continue;
+            }
+            let Some(next) = tokens.get(index + 2) else {
+                continue;
+            };
+            if !clash || dot(index + 3) || known(&next.text) {
+                body = true;
+            }
+        }
+        // From the start of its first line to the end of its delimiter's.
+        let first = text[..start]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |at| at + 1);
+        let last = text[end..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(text.len(), |at| end + at + 1);
+        // The line of a byte, from 1: how many lines start at or before it.
+        let line_of = |at: usize| line_starts.partition_point(|(start, _)| *start <= at) as u64;
+        let lines = line_of(first)..line_of(last.saturating_sub(1)) + 1;
+        let Some(head) = head else {
+            if body {
+                // Of a kind Kerno cannot tell: never run as it is unless asked.
+                creates = true;
+                whole.get_or_insert_with(|| {
+                    "it holds a statement of a kind Kerno does not know that names that database"
+                        .to_string()
+                });
+                found.push(Naming {
+                    kind: "statement",
+                    name: String::new(),
+                    creates,
+                    range: first as u64..last as u64,
+                    lines,
+                });
+            }
+            continue;
+        };
+        if !(creates || body) {
+            continue;
+        }
+        let alone = text[first..start].iter().all(u8::is_ascii_whitespace)
+            && text[end..last].iter().all(u8::is_ascii_whitespace);
+        if creates && !alone {
+            whole.get_or_insert_with(|| {
+                format!(
+                    "the {} “{}” shares its lines with other statements",
+                    head.kind, head.name
+                )
+            });
+        }
+        found.push(Naming {
+            kind: head.kind,
+            name: head.name,
+            creates,
+            range: first as u64..last as u64,
+            lines,
+        });
+    }
+    (found, whole)
+}
+
+/// The statements of `text`, each from its first byte of code to the end
+/// of its delimiter, `DELIMITER` lines followed as the mysql client does.
+fn split_statements(
+    text: &[u8],
+    part: &[Quoted],
+    line_starts: &[(usize, Quoted)],
+) -> Vec<(usize, usize)> {
+    let mut statements = Vec::new();
+    let mut delimiter: Vec<u8> = b";".to_vec();
+    let mut open: Option<usize> = None;
+    for (index, &(start, state)) in line_starts.iter().enumerate() {
+        let end = line_starts
+            .get(index + 1)
+            .map_or(text.len(), |(next, _)| *next);
+        let line = &text[start..end];
+        let lead = line
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+        let word = line[lead..]
+            .iter()
+            .take_while(|byte| !byte.is_ascii_whitespace())
+            .count();
+        if open.is_none()
+            && state == Quoted::Code
+            && line[lead..lead + word].eq_ignore_ascii_case(b"delimiter")
+        {
+            let value: Vec<u8> = line[lead + word..]
+                .iter()
+                .skip_while(|byte| byte.is_ascii_whitespace())
+                .take_while(|byte| !byte.is_ascii_whitespace())
+                .copied()
+                .collect();
+            if !value.is_empty() {
+                delimiter = value;
+            }
+            continue;
+        }
+        let mut at = start;
+        while at < end {
+            let code = part[at] == Quoted::Code;
+            if open.is_none() && code && !text[at].is_ascii_whitespace() {
+                open = Some(at);
+            }
+            if let Some(first) = open
+                && text[at..].starts_with(&delimiter)
+                && part[at..at + delimiter.len()]
+                    .iter()
+                    .all(|what| *what == Quoted::Code)
+            {
+                statements.push((first, at + delimiter.len()));
+                open = None;
+                at += delimiter.len();
+                continue;
+            }
+            // A quoted name opens a statement too.
+            if open.is_none() && part[at] == Quoted::Backtick {
+                open = Some(at);
+            }
+            at += 1;
+        }
+    }
+    if let Some(first) = open {
+        statements.push((first, text.len()));
+    }
+    statements
+}
+
+/// A word of a statement: a keyword or a name, or one of `.()=@,`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    text: String,
+    /// A name in backticks: never a keyword.
+    quoted: bool,
+}
+
+impl Token {
+    fn is(&self, word: &str) -> bool {
+        !self.quoted && self.text.eq_ignore_ascii_case(word)
+    }
+}
+
+/// The words of a statement's code and quoted names (unquoted), and its
+/// `.`, `(`, `)`, `=`, `@` and `,`; the `/*!NNNNN` and `*/` of versioned
+/// comments read as spaces, strings and comments left out.
+fn tokens(text: &[u8], part: &[Quoted]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    let word =
+        |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80;
+    while at < text.len() {
+        let byte = text[at];
+        match part[at] {
+            // From the opening backtick to the closing one, doubled ones
+            // read as one.
+            Quoted::Backtick => {
+                let mut close = at + 1;
+                let mut name = Vec::new();
+                while close < text.len() && part[close] == Quoted::Backtick {
+                    if text[close] == b'`' {
+                        if text.get(close + 1) == Some(&b'`') {
+                            name.push(b'`');
+                            close += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    name.push(text[close]);
+                    close += 1;
+                }
+                tokens.push(Token {
+                    text: String::from_utf8_lossy(&name).into_owned(),
+                    quoted: true,
+                });
+                at = close + 1;
+            }
+            Quoted::Code if text[at..].starts_with(b"/*!") || text[at..].starts_with(b"/*+") => {
+                at += 3;
+                while at < text.len() && text[at].is_ascii_digit() {
+                    at += 1;
+                }
+            }
+            Quoted::Code if text[at..].starts_with(b"*/") => at += 2,
+            Quoted::Code if word(byte) => {
+                let end = (at..text.len())
+                    .find(|&end| part[end] != Quoted::Code || !word(text[end]))
+                    .unwrap_or(text.len());
+                tokens.push(Token {
+                    text: String::from_utf8_lossy(&text[at..end]).into_owned(),
+                    quoted: false,
+                });
+                at = end;
+            }
+            Quoted::Code if b".()=@,".contains(&byte) => {
+                tokens.push(Token {
+                    text: (byte as char).to_string(),
+                    quoted: false,
+                });
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    tokens
+}
+
+/// What a statement creates, drops or alters, as its first words say.
+struct Head {
+    kind: &'static str,
+    name: String,
+    /// The tokens that name it (and a trigger's table): a qualifier before
+    /// one of them is the statement's own, not its body's.
+    names: Vec<usize>,
+}
+
+/// The head of a `CREATE`, `DROP` or `ALTER` statement of a kind the folder's
+/// files hold, `None` for any other statement.
+fn head(tokens: &[Token]) -> Option<Head> {
+    const KINDS: [(&str, &str); 7] = [
+        ("TRIGGER", "trigger"),
+        ("PROCEDURE", "procedure"),
+        ("FUNCTION", "function"),
+        ("EVENT", "event"),
+        ("VIEW", "view"),
+        ("DATABASE", "database"),
+        ("SCHEMA", "database"),
+    ];
+    let verb = tokens.first()?;
+    if !["CREATE", "DROP", "ALTER"].iter().any(|word| verb.is(word)) {
+        return None;
+    }
+    // The first kind word, before any `(`.
+    let (at, kind) = tokens
+        .iter()
+        .enumerate()
+        .take_while(|(_, token)| !token.is("("))
+        .find_map(|(at, token)| {
+            KINDS
+                .iter()
+                .find(|(word, _)| token.is(word))
+                .map(|(_, kind)| (at, *kind))
+        })?;
+    let mut name_at = at + 1;
+    for word in ["IF", "NOT", "EXISTS"] {
+        if tokens.get(name_at).is_some_and(|token| token.is(word)) {
+            name_at += 1;
+        }
+    }
+    let dot = |index: usize| tokens.get(index).is_some_and(|token| token.is("."));
+    let mut names = vec![name_at];
+    let mut name = tokens.get(name_at)?.text.clone();
+    if dot(name_at + 1) {
+        name = tokens.get(name_at + 2)?.text.clone();
+        names.push(name_at + 2);
+    }
+    // A trigger's table, after its ON.
+    if kind == "trigger"
+        && let Some(on) = tokens
+            .iter()
+            .enumerate()
+            .skip(name_at)
+            .take(8)
+            .find(|(_, token)| token.is("ON"))
+            .map(|(on, _)| on + 1)
+    {
+        names.push(on);
+        if dot(on + 1) {
+            names.push(on + 2);
+        }
+    }
+    Some(Head { kind, name, names })
+}
+
+/// Whether the name at `index` is qualified (`q.name`) by a word `same`
+/// takes for the source.
+fn qualified_by(tokens: &[Token], index: usize, same: &impl Fn(&str) -> bool) -> bool {
+    index >= 2 && tokens[index - 1].is(".") && same(&tokens[index - 2].text)
+}
+
+/// The statements of the backup's files after the tables that name the
+/// database it was taken from (K78), read from `folder` (each file up to
+/// [`NAMING_WITHIN`]). Blocking.
+pub fn naming(folder: &Path, manifest: &Manifest) -> Vec<FileNaming> {
+    let local: Vec<String> = manifest
+        .tables
+        .iter()
+        .map(|table| table.table.clone())
+        .chain(
+            manifest
+                .after
+                .iter()
+                .filter(|after| after.kind == AfterKind::Views)
+                .flat_map(|after| after.objects.iter().cloned()),
+        )
+        .collect();
+    manifest
+        .after
+        .iter()
+        .map(|after| {
+            let path = folder.join(&after.file);
+            let read = std::fs::metadata(&path).and_then(|meta| {
+                if meta.len() > NAMING_WITHIN {
+                    return Err(std::io::Error::other(format!(
+                        "it is larger than {} MB",
+                        NAMING_WITHIN >> 20
+                    )));
+                }
+                std::fs::read(&path)
+            });
+            match read {
+                Ok(text) => {
+                    let (found, mut whole) = find_naming(&text, &manifest.database, &local);
+                    if after.kind == AfterKind::Views && found.iter().any(|named| named.creates) {
+                        whole.get_or_insert_with(|| {
+                            "mysqldump writes a stand-in for each view first, which would stay"
+                                .to_string()
+                        });
+                    }
+                    FileNaming {
+                        file: after.file.clone(),
+                        kind: after.kind,
+                        found,
+                        whole,
+                    }
+                }
+                Err(error) => FileNaming {
+                    file: after.file.clone(),
+                    kind: after.kind,
+                    found: Vec::new(),
+                    whole: Some(format!("Kerno could not read it to tell ({error})")),
+                },
+            }
+        })
+        .collect()
+}
+
+/// `namings` counted by kind ("2 triggers and 1 procedure") and their first
+/// names ("“big_bi”, “big_ai”"), for a sentence.
+fn counted(namings: &[&Naming]) -> (String, String) {
+    const WORDS: [(&str, &str, &str); 7] = [
+        ("trigger", "trigger", "triggers"),
+        ("procedure", "procedure", "procedures"),
+        ("function", "function", "functions"),
+        ("event", "event", "events"),
+        ("view", "view", "views"),
+        (
+            "database",
+            "ALTER DATABASE statement",
+            "ALTER DATABASE statements",
+        ),
+        ("statement", "other statement", "other statements"),
+    ];
+    let counts: Vec<String> = WORDS
+        .iter()
+        .filter_map(|(kind, one, many)| {
+            let n = namings.iter().filter(|named| named.kind == *kind).count();
+            match n {
+                0 => None,
+                1 => Some(format!("1 {one}")),
+                n => Some(format!("{n} {many}")),
+            }
+        })
+        .collect();
+    let counts = match counts.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    let names: Vec<String> = namings
+        .iter()
+        .filter(|named| !named.name.is_empty() && named.kind != "database")
+        .map(|named| format!("“{}”", named.name))
+        .collect();
+    let names = match names.len() {
+        0 => String::new(),
+        n if n > 3 => format!("{} and {} more", names[..3].join(", "), n - 3),
+        _ => names.join(", "),
+    };
+    (counts, names)
+}
+
+/// What a restore of a backup of `source` into `target` does with the
+/// statements of [`naming`] (K78), before the run (`ran` false) or at its
+/// end; `None` when nothing names `source`. Said in the wizard, the simple
+/// view, the confirmation and the run's end.
+pub fn naming_said(
+    found: &[FileNaming],
+    source: &str,
+    target: &str,
+    as_written: bool,
+    ran: bool,
+) -> Option<String> {
+    let mut text = String::new();
+    let them = |names: &str| {
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!(" ({names})")
+        }
+    };
+    // Left out one by one: the statements that write into the source.
+    let creating: Vec<&Naming> = found
+        .iter()
+        .filter(|file| file.whole.is_none())
+        .flat_map(|file| file.found.iter().filter(|named| named.creates))
+        .collect();
+    if !creating.is_empty() {
+        let (counts, names) = counted(&creating);
+        let one = creating.len() == 1;
+        text.push_str(&match (ran, as_written) {
+            (false, false) => format!(
+                " {counts} of this backup{} {} written for the database “{source}”: restored \
+                 into “{target}” as {}, {} would be created in “{source}”, not in “{target}”. \
+                 Kerno leaves {} out unless you tick “Load them as written”; the tables, their \
+                 rows and everything else are loaded.",
+                them(&names),
+                if one { "is" } else { "are" },
+                if one { "it is" } else { "they are" },
+                if one { "it" } else { "they" },
+                if one { "it" } else { "them" },
+            ),
+            (false, true) => format!(
+                " {counts} of this backup{} {} written for the database “{source}”: you chose \
+                 to load {} as written, so {} {} created in “{source}”, not in “{target}”.",
+                them(&names),
+                if one { "is" } else { "are" },
+                if one { "it" } else { "them" },
+                if one { "it" } else { "they" },
+                if one { "is" } else { "are" },
+            ),
+            (true, false) => format!(
+                " Left out: {counts}{}, written for the database “{source}”: as {}, {} would \
+                 have been created in “{source}”, not in “{target}”.",
+                them(&names),
+                if one { "it is" } else { "they are" },
+                if one { "it" } else { "they" },
+            ),
+            (true, true) => format!(
+                " Loaded as written, into “{source}”: {counts}{}.",
+                them(&names)
+            ),
+        });
+    }
+    // Left out whole: the files whose statements cannot be cut one by one.
+    for file in found.iter().filter(|file| file.whole.is_some()) {
+        let why = file.whole.as_deref().unwrap_or_default();
+        let writing: Vec<&Naming> = file.found.iter().filter(|named| named.creates).collect();
+        let (counts, names) = counted(&writing);
+        let holding = if counts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", where {counts}{} would write into “{source}”",
+                them(&names)
+            )
+        };
+        text.push_str(&match (ran, as_written) {
+            (false, true) => format!(" {} is loaded as written{holding}.", file.file),
+            (true, true) => format!(" {} was loaded as written{holding}.", file.file),
+            (false, false) => format!(
+                " {} is left out whole{holding}: Kerno cannot leave out only those statements \
+                 ({why}).",
+                file.file
+            ),
+            (true, false) => format!(
+                " Left out: all of {}{holding} (Kerno could not leave out only those statements: \
+                 {why}).",
+                file.file
+            ),
+        });
+    }
+    let writes = !creating.is_empty() || found.iter().any(|file| file.whole.is_some());
+    if writes && !as_written {
+        // One statement left out, not a whole file: "it".
+        let single = creating.len() == 1 && found.iter().all(|file| file.whole.is_none());
+        let files: Vec<&str> = found
+            .iter()
+            .filter(|file| file.writes())
+            .map(|file| file.file.as_str())
+            .collect();
+        text.push_str(&format!(
+            " To have {} in “{target}”, edit {} and run it there; or restore into a database \
+             named “{source}”.",
+            match (ran, single) {
+                (_, true) => "it",
+                (true, false) => "them",
+                (false, false) => "those",
+            },
+            files.join(" and ")
+        ));
+    }
+    // Loaded either way: bodies that only name the source.
+    let using: Vec<&Naming> = found
+        .iter()
+        .filter(|file| file.whole.is_none() || as_written)
+        .flat_map(|file| file.found.iter().filter(|named| !named.creates))
+        .collect();
+    if !using.is_empty() {
+        let (counts, names) = counted(&using);
+        let one = using.len() == 1;
+        text.push_str(&format!(
+            " {counts}{} {} or {} “{source}” by name: {} into “{target}”, {} on “{source}” each \
+             time {} {}.",
+            them(&names),
+            if one { "reads" } else { "read" },
+            if one { "writes" } else { "write" },
+            if ran { "loaded" } else { "restored" },
+            if one { "it acts" } else { "they act" },
+            if one { "it" } else { "they" },
+            if one { "runs" } else { "run" },
+        ));
+    }
+    let text = text.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 /// What Kerno writes after each table's definition in the definitions'
 /// run, and reads back from the client: that definition ran.
 const DEFINED: &str = "kerno-defined:";
@@ -2163,11 +2799,13 @@ enum Dropped {
 }
 
 /// Reads, on one `mysql` client, which of `tables` the target holds, and
-/// whether each holds a row. Within 30 s each read.
+/// whether each holds a row; and which of `views` it holds (K78). Within
+/// 30 s each read.
 async fn tables_now(
     job: &FolderRestore,
     tables: &[String],
-) -> std::result::Result<BTreeMap<String, Now>, String> {
+    views: &[String],
+) -> std::result::Result<(BTreeMap<String, Now>, Vec<String>), String> {
     // Never behind a lock a stopped client's statement still holds for long.
     let head = "/*!50503 SET SESSION lock_wait_timeout = 10 */; ";
     let read = async |queries: Vec<String>| -> std::result::Result<BTreeMap<usize, bool>, String> {
@@ -2190,14 +2828,17 @@ async fn tables_now(
         Ok(found)
     };
     let hex = |name: &str| -> String { name.bytes().map(|byte| format!("{byte:02X}")).collect() };
+    // The tables first, then the views, numbered after them.
     let there = read(
         tables
             .iter()
+            .map(|name| (name, "BASE TABLE"))
+            .chain(views.iter().map(|name| (name, "VIEW")))
             .enumerate()
-            .map(|(at, name)| {
+            .map(|(at, (name, kind))| {
                 format!(
                     "SELECT {at}, EXISTS(SELECT 1 FROM information_schema.TABLES WHERE \
-                     TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME = \
+                     TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = '{kind}' AND TABLE_NAME = \
                      _utf8 X'{}')",
                     hex(name)
                 )
@@ -2205,6 +2846,12 @@ async fn tables_now(
             .collect(),
     )
     .await?;
+    let views_there = views
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| there.get(&(tables.len() + at)) == Some(&true))
+        .map(|(_, name)| name.clone())
+        .collect();
     let held = read(
         tables
             .iter()
@@ -2224,7 +2871,7 @@ async fn tables_now(
         };
         now.insert(name.clone(), state);
     }
-    Ok(now)
+    Ok((now, views_there))
 }
 
 /// The `mysql` client's options that change what it prints: Kerno reads
@@ -2492,13 +3139,17 @@ async fn restore_in(
                 .map(|piece| job.options.input.join(&piece.file))
         })
         .collect();
+    // Into another database than the backup's own: the statements that
+    // name the backup's database, read before anything runs (K78).
+    let renamed = job.options.database != manifest.database;
+    let (folder, listed) = (job.options.input.clone(), manifest.clone());
     // All the files before the first client: a refusal loads nothing.
     let checking = cancel.clone();
-    let definitions = tokio::task::spawn_blocking(move || {
+    let (definitions, named) = tokio::task::spawn_blocking(move || {
         checks
             .iter()
             .try_for_each(|check| check_script(check, &checking))?;
-        firsts
+        let definitions = firsts
             .iter()
             .map(|path| match path {
                 Some(path) => find_definition(path).map_err(|error| {
@@ -2506,10 +3157,24 @@ async fn restore_in(
                 }),
                 None => Ok(None),
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+        let named = if renamed {
+            naming(&folder, &listed)
+        } else {
+            Vec::new()
+        };
+        Ok::<_, Error>((definitions, named))
     })
     .await
     .map_err(|error| Error::io("checking the backup's files", std::io::Error::other(error)))??;
+    let as_written = job.options.load_as_written;
+    let note = naming_said(
+        &named,
+        &manifest.database,
+        &job.options.database,
+        as_written,
+        true,
+    );
     let mut defined = BTreeSet::new();
     let mut stopped = if defines && !manifest.tables.is_empty() {
         on_line(format!(
@@ -2615,9 +3280,54 @@ async fn restore_in(
         groups.push(stages);
     }
     let mut finishing = VecDeque::new();
+    // Per file, the lines left out (first line, how many), to say a failure
+    // at the line of the file itself.
+    let mut cut_lines: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
     for after in &manifest.after {
         let mut command = job.file_command(&after.file)?;
         command.script_check = None;
+        // What would write into the backup's own database is left out,
+        // unless asked (K78): a statement at a time where it stands alone on
+        // its lines, else the whole file. Its bytes count as sent.
+        if let Some(file) = named
+            .iter()
+            .find(|file| file.file == after.file && file.writes())
+            .filter(|_| !as_written)
+        {
+            let path = command.stdin.take().unwrap_or_default();
+            let len = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+            if file.whole.is_some() {
+                on_line(format!("Kerno: {} is left out.", after.file));
+                job.sent.fetch_add(len, Ordering::Relaxed);
+                continue;
+            }
+            let mut kept = Vec::new();
+            let mut from = 0;
+            for named in file.found.iter().filter(|named| named.creates) {
+                on_line(format!(
+                    "Kerno: left out of {}: the {} “{}”, written for “{}”.",
+                    after.file, named.kind, named.name, manifest.database
+                ));
+                kept.push(from..named.range.start);
+                job.sent
+                    .fetch_add(named.range.end - named.range.start, Ordering::Relaxed);
+                from = named.range.end;
+                cut_lines
+                    .entry(&after.file)
+                    .or_default()
+                    .push((named.lines.start, named.lines.end - named.lines.start));
+            }
+            kept.push(from..len);
+            command.stdin_parts = kept
+                .into_iter()
+                .filter(|range| !range.is_empty())
+                .map(|range| StdinPart::File {
+                    path: path.clone(),
+                    range,
+                    counted: true,
+                })
+                .collect();
+        }
         finishing.push_back(Stage::Side(vec![Job {
             file: after.file.clone(),
             label: after.label().into(),
@@ -2660,18 +3370,34 @@ async fn restore_in(
         || tables.cancelled
         || finished.as_ref().is_some_and(|end| end.cancelled);
     if failure.is_none() && !cancelled {
+        // What was left out, or loaded into the backup's own database, for
+        // the dialog's words (K78).
+        if let Some(note) = &note {
+            on_line(format!("Kerno: {note}"));
+        }
+        *stopped_said = note;
         return Ok(());
     }
     // What the definitions left: read from the target once every client
-    // ended.
+    // ended, with the backup's views it holds (K78).
+    let mut views_there = Vec::new();
     let dropped = if defines {
         let names: Vec<String> = manifest
             .tables
             .iter()
             .map(|table| table.table.clone())
             .collect();
-        match tables_now(job, &names).await {
-            Ok(now) => Dropped::Read(now),
+        let views: Vec<String> = manifest
+            .after
+            .iter()
+            .filter(|after| after.kind == AfterKind::Views)
+            .flat_map(|after| after.objects.iter().cloned())
+            .collect();
+        match tables_now(job, &names, &views).await {
+            Ok((now, there)) => {
+                views_there = there;
+                Dropped::Read(now)
+            }
             Err(why) => Dropped::Unread(why),
         }
     } else {
@@ -2682,21 +3408,82 @@ async fn restore_in(
         .filter_map(|index| manifest.tables.get(*index))
         .map(|table| table.table.as_str())
         .collect();
+    // A failure in a file after the tables, every table in: a rerun loads
+    // them again and stops at the same statement (K78). Said at the line of
+    // the file itself, with the statement there when it names the source.
+    let after_failed = stopped.is_none() && tables.failure.is_none() && !tables.cancelled;
+    let mut failed_at = None;
+    let failure = match failure {
+        Some((label, reason)) if after_failed => {
+            let file = manifest
+                .after
+                .iter()
+                .find(|after| after.label() == label)
+                .map(|after| after.file.as_str())
+                .unwrap_or_default();
+            let cut = cut_lines.get(file).map(Vec::as_slice).unwrap_or_default();
+            let (reason, line) = at_file_line(&reason, file, cut);
+            failed_at = line.and_then(|line| {
+                named
+                    .iter()
+                    .filter(|named| named.file == file)
+                    .flat_map(|named| named.found.iter())
+                    .find(|named| named.lines.contains(&line))
+            });
+            Some((label, reason))
+        }
+        failure => failure,
+    };
+    let after_failure = failure
+        .as_ref()
+        .filter(|_| after_failed)
+        .map(|(_, reason)| (reason.as_str(), failed_at));
     let summary = restore_summary(
         manifest,
         &job.options.database,
         &tables,
         finished.as_ref(),
-        &Reached { defined, dropped },
+        &Reached {
+            defined,
+            dropped,
+            views_there,
+            after_failure,
+        },
     );
+    // After a stop, only what was left out is sure: what was loaded as
+    // written, or the bodies that name the source, may not have run.
+    let note = if as_written {
+        None
+    } else {
+        let writing: Vec<FileNaming> = named
+            .iter()
+            .map(|file| FileNaming {
+                found: file
+                    .found
+                    .iter()
+                    .filter(|named| named.creates)
+                    .cloned()
+                    .collect(),
+                ..file.clone()
+            })
+            .collect();
+        naming_said(
+            &writing,
+            &manifest.database,
+            &job.options.database,
+            false,
+            true,
+        )
+    };
+    let note = note.map(|note| format!(" {note}")).unwrap_or_default();
     match failure {
         Some((label, reason)) => Err(Error::Config(format!(
-            "mysql failed on {label}: {reason}. {summary}"
+            "mysql failed on {label}: {reason}. {summary}{note}"
         ))),
         None => {
             on_line(format!("Kerno: {summary}"));
             // For the dialog's own words after a cancel (F3).
-            *stopped_said = Some(summary);
+            *stopped_said = Some(format!("{summary}{note}"));
             Err(Error::Cancelled)
         }
     }
@@ -2707,6 +3494,39 @@ async fn restore_in(
 struct Reached<'a> {
     defined: BTreeSet<&'a str>,
     dropped: Dropped,
+    /// The backup's views the target holds, as read after the stop.
+    views_there: Vec<String>,
+    /// What the client said when a file after the tables failed, every
+    /// table being in, and the statement it failed on when that one names
+    /// the source.
+    after_failure: Option<(&'a str, Option<&'a Naming>)>,
+}
+
+/// A client's "at line N" of a file after the tables that was fed without
+/// the lines `cut` (each its first line and how many): said at the line of
+/// `file` itself, which is returned too.
+fn at_file_line(said: &str, file: &str, cut: &[(u64, u64)]) -> (String, Option<u64>) {
+    let Some((before, after)) = said.split_once(" at line ") else {
+        return (said.to_string(), None);
+    };
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let Ok(mut line) = digits.parse::<u64>() else {
+        return (said.to_string(), None);
+    };
+    for (first, count) in cut {
+        if *first <= line {
+            line += count;
+        } else {
+            break;
+        }
+    }
+    (
+        format!(
+            "{before} at line {line} of {file}{}",
+            &after[digits.len()..]
+        ),
+        Some(line),
+    )
 }
 
 /// What a stopped restore into `database` loaded: the tables in, partly in,
@@ -2720,13 +3540,30 @@ fn restore_summary(
     reached: &Reached,
 ) -> String {
     let dropped = &reached.dropped;
-    let after_left: Vec<&str> = manifest
+    let after_left: Vec<String> = manifest
         .after
         .iter()
         .filter(|file| {
             !after.is_some_and(|end| end.states.get(&file.file) == Some(&FileState::Done))
         })
-        .map(AfterFile::label)
+        .map(|file| {
+            let started = after.is_some_and(|end| end.states.contains_key(&file.file));
+            let there = &reached.views_there;
+            // A view of an earlier restore is still there, untouched (K78).
+            if file.kind == AfterKind::Views && !started && !there.is_empty() {
+                let quoted: Vec<String> = there.iter().map(|view| format!("“{view}”")).collect();
+                format!(
+                    "{} (“{database}” already held {} of them, {}: left as {} {})",
+                    file.label(),
+                    there.len(),
+                    capped(&quoted),
+                    if there.len() == 1 { "it" } else { "they" },
+                    if there.len() == 1 { "was" } else { "were" },
+                )
+            } else {
+                file.label().to_string()
+            }
+        })
         .collect();
     let after_text = if after_left.is_empty() {
         String::new()
@@ -2815,6 +3652,10 @@ fn restore_summary(
         ));
     }
     text.push_str(&after_text);
+    if let Some((reason, failed)) = reached.after_failure {
+        text.push_str(&after_advice(reason, failed, &manifest.database, database));
+        return text;
+    }
     text.push_str(if drops {
         " Run the restore again: it drops each of the backup's tables and loads it from the \
          start."
@@ -2822,6 +3663,64 @@ fn restore_summary(
         " The backup has no DROP TABLE statements: drop the tables it created before you run \
          it again."
     });
+    text
+}
+
+/// What to do when a file after the tables failed, every table and its
+/// rows being in (K78): a rerun loads the tables again and stops at the
+/// same statement, so the advice follows what the statement named: `failed`
+/// when Kerno found it naming the source, else the server's words.
+fn after_advice(reason: &str, failed: Option<&Naming>, source: &str, database: &str) -> String {
+    let lower = reason.to_lowercase();
+    let source_lower = source.to_lowercase();
+    // MariaDB quotes names as `'db.name'`; MySQL 8.4 leaves a trigger's out.
+    let names_source = source != database
+        && [
+            format!("'{source_lower}."),
+            format!("`{source_lower}`."),
+            format!(" {source_lower}."),
+        ]
+        .iter()
+        .any(|form| lower.contains(form));
+    let mut text = String::from(" Every table and its rows are in place.");
+    match failed.filter(|_| source != database) {
+        Some(named) => text.push_str(&format!(
+            " The statement that failed, the {} “{}”, {} “{source}”, the database the backup was \
+             taken from, not “{database}”{}.",
+            named.kind,
+            named.name,
+            if named.creates {
+                "is written for"
+            } else {
+                "names"
+            },
+            if named.creates {
+                ": as written it acts there"
+            } else {
+                ""
+            }
+        )),
+        None if names_source => text.push_str(&format!(
+            " The statement that failed names “{source}”, the database the backup was taken \
+             from, not “{database}”: as written it acts there."
+        )),
+        None => {}
+    }
+    if lower.contains("error 1359") || lower.contains("already exists") {
+        text.push_str(
+            " What it creates already exists where it names: running the restore again stops at \
+             the same statement.",
+        );
+    } else {
+        text.push_str(
+            " Running the restore again loads every table again and stops at the same statement \
+             unless what the error names is changed first.",
+        );
+    }
+    text.push_str(&format!(
+        " What follows that statement in its file, and the files after it, can be run by \
+         themselves in “{database}” (Execute script) once mended."
+    ));
     text
 }
 
@@ -3714,6 +4613,8 @@ mod tests {
         let rows_only = Reached {
             defined: BTreeSet::new(),
             dropped: Dropped::No,
+            views_there: Vec::new(),
+            after_failure: None,
         };
         let text = restore_summary(&manifest, "db", &tables, None, &rows_only);
         assert_eq!(
@@ -3940,6 +4841,8 @@ mod tests {
                     .map(|(name, now)| (name.to_string(), now))
                     .collect(),
             ),
+            views_there: Vec::new(),
+            after_failure: None,
         };
         // Every definition ran; then a file failed.
         let mut tables = PoolEnd::default();
@@ -3992,6 +4895,8 @@ mod tests {
                     .map(|at| (format!("t{at:02}"), Now::Missing))
                     .collect(),
             ),
+            views_there: Vec::new(),
+            after_failure: None,
         };
         let text = restore_summary(&long, "db", &PoolEnd::default(), None, &none);
         assert!(
@@ -4005,6 +4910,8 @@ mod tests {
         let unread = Reached {
             defined: all.into_iter().collect(),
             dropped: Dropped::Unread("it did not answer within 30 s".into()),
+            views_there: Vec::new(),
+            after_failure: None,
         };
         let text = restore_summary(&manifest, "db", &tables, None, &unread);
         assert!(
@@ -4060,5 +4967,339 @@ mod tests {
         let alone = dump_client_problem(Some(&m26), Engine::MySql, (5, 1, 73), &[]).unwrap();
         assert!(alone.contains("none was found"), "{alone}");
         assert!(dump_client_problem(None, Engine::MySql, (5, 1, 73), &found).is_none());
+    }
+
+    /// What [`find_naming`] found, as `(kind, name, creates)`.
+    fn named(text: &[u8], source: &str, local: &[&str]) -> (Vec<(String, String, bool)>, bool) {
+        let local: Vec<String> = local.iter().map(|name| name.to_string()).collect();
+        let (found, whole) = find_naming(text, source, &local);
+        for named in &found {
+            // Each range is whole lines, the statement's delimiter its end.
+            let range = &text[named.range.start as usize..named.range.end as usize];
+            assert!(
+                named.range.start == 0 || text[named.range.start as usize - 1] == b'\n',
+                "{named:?}"
+            );
+            assert!(
+                range.ends_with(b"\n") || named.range.end as usize == text.len(),
+                "{named:?}: {}",
+                String::from_utf8_lossy(range)
+            );
+        }
+        (
+            found
+                .into_iter()
+                .map(|named| (named.kind.to_string(), named.name, named.creates))
+                .collect(),
+            whole.is_some(),
+        )
+    }
+
+    fn hit(kind: &str, name: &str, creates: bool) -> (String, String, bool) {
+        (kind.into(), name.into(), creates)
+    }
+
+    /// K78: the statements of `routines.sql` and `views.sql` that name the
+    /// database the backup was taken from, on real mysqldump 26.10 files of
+    /// MariaDB 11 and MySQL 8.4 (`tests/fixtures/mysqldump/k78-*`): a
+    /// trigger created with the database written out (MariaDB keeps its
+    /// header as typed, MySQL rewrites it), a trigger, a procedure and an
+    /// event whose bodies name it, a function that names it only in a
+    /// string and a comment, a view (written without it on both). A
+    /// database named like one of its tables: `src.n` (a column of the
+    /// table `src`) is not a hit, `src.other` (a table) is.
+    #[test]
+    fn the_statements_that_name_the_source_are_found_outside_strings_and_comments() {
+        let folder = crate::testing::fixtures().join("mysqldump");
+        let read = |file: &str| std::fs::read(folder.join(file)).unwrap();
+        let fx = "kerno_test_k78_fx";
+        let local = ["audit", "big", "big_v"];
+        assert_eq!(
+            named(&read("k78-maria-fx-routines.sql"), fx, &local),
+            (
+                vec![
+                    hit("trigger", "big_bi", true),
+                    hit("trigger", "big_ai", true),
+                    hit("event", "nightly", false),
+                    hit("procedure", "count_big", false),
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            named(&read("k78-84-fx-routines.sql"), fx, &local),
+            (
+                vec![
+                    hit("trigger", "big_ai", false),
+                    hit("event", "nightly", false),
+                    hit("procedure", "count_big", false),
+                ],
+                false
+            )
+        );
+        for file in ["k78-maria-fx-views.sql", "k78-84-fx-views.sql"] {
+            assert_eq!(named(&read(file), fx, &local), (vec![], false), "{file}");
+        }
+        // The name compared without case.
+        assert_eq!(
+            named(
+                &read("k78-maria-fx-routines.sql"),
+                &fx.to_uppercase(),
+                &local
+            )
+            .0[0],
+            hit("trigger", "big_bi", true)
+        );
+        let same = "kerno_test_k78_same";
+        for file in ["k78-maria-same-routines.sql", "k78-84-same-routines.sql"] {
+            assert_eq!(
+                named(&read(file), same, &[same, "other"]),
+                (vec![hit("trigger", "same_bi", false)], false),
+                "{file}"
+            );
+        }
+
+        // The cut of the MariaDB file keeps every other line: each left-out
+        // range is one statement alone on its lines, its DELIMITER kept.
+        let text = read("k78-maria-fx-routines.sql");
+        let local: Vec<String> = local.iter().map(|name| name.to_string()).collect();
+        let (found, _) = find_naming(&text, fx, &local);
+        // Their lines, from 1: the trigger's one, the procedure's three.
+        assert_eq!(found[0].lines, 26..27);
+        assert_eq!(found[3].lines, 114..117);
+        let mut kept = Vec::new();
+        let mut from = 0;
+        for named in found.iter().filter(|named| named.creates) {
+            kept.extend_from_slice(&text[from..named.range.start as usize]);
+            from = named.range.end as usize;
+        }
+        kept.extend_from_slice(&text[from..]);
+        let kept = String::from_utf8(kept).unwrap();
+        assert!(
+            !kept.contains("TRIGGER") && !kept.contains("trigger "),
+            "{kept}"
+        );
+        assert_eq!(kept.matches("DELIMITER ;;").count(), 5, "{kept}");
+        assert_eq!(kept.matches("DELIMITER ;\n").count(), 5, "{kept}");
+        assert!(kept.contains("EVENT `nightly`") && kept.contains("PROCEDURE `count_big`"));
+
+        // Shapes mysqldump did not write here.
+        let src = "src";
+        for (text, expected) in [
+            // Strings and comments of every kind.
+            (
+                "CREATE TRIGGER x BEFORE INSERT ON t FOR EACH ROW SET NEW.a = 'src.t', \
+                 NEW.b = \"src.t\"; -- src.t\n# src.t\n/* src.t */\n"
+                    .to_string(),
+                (vec![], false),
+            ),
+            // A definer quoted like a kind word; a backticked qualifier.
+            (
+                "DELIMITER ;;\nCREATE DEFINER=`event`@`%` PROCEDURE `p`() SELECT * FROM \
+                 `src`.`t` ;;\nDELIMITER ;\n"
+                    .into(),
+                (vec![hit("procedure", "p", false)], false),
+            ),
+            // `x.src.y`: `src` is a table there.
+            (
+                "CREATE PROCEDURE p() SELECT other.src.c FROM other.src;\n".into(),
+                (vec![], false),
+            ),
+            // A trigger of the source's table, its own name unqualified.
+            (
+                "CREATE TRIGGER x BEFORE INSERT ON `src`.`t` FOR EACH ROW SET NEW.a = 1;\n".into(),
+                (vec![hit("trigger", "x", true)], false),
+            ),
+            (
+                "DROP PROCEDURE IF EXISTS src.p;\n".into(),
+                (vec![hit("procedure", "p", true)], false),
+            ),
+            (
+                "/*!50003 ALTER DATABASE `src` CHARACTER SET latin1 COLLATE latin1_swedish_ci */ \
+                 ;\n"
+                .into(),
+                (vec![hit("database", "src", true)], false),
+            ),
+            // A quoted name holding the delimiter and the source's name.
+            (
+                "CREATE VIEW `a;src.b` AS SELECT 1;\n".into(),
+                (vec![], false),
+            ),
+            // Not alone on its lines: the file goes whole.
+            (
+                "DELIMITER ;;\n/*!50003 CREATE*/ /*!50003 TRIGGER src.x BEFORE INSERT ON src.t \
+                 FOR EACH ROW SET NEW.a = 1 */;; SELECT 1;;\nDELIMITER ;\n"
+                    .into(),
+                (vec![hit("trigger", "x", true)], true),
+            ),
+            // A statement of a kind Kerno does not know: whole, too.
+            (
+                "INSERT INTO src.t VALUES (1);\n".into(),
+                (vec![hit("statement", "", true)], true),
+            ),
+        ] {
+            assert_eq!(named(text.as_bytes(), src, &["t"]), expected, "{text}");
+        }
+    }
+
+    /// K78: what the wizard, the confirmation and the run's end say of the
+    /// statements that name the source, by default and loaded as written.
+    #[test]
+    fn what_names_the_source_is_said_before_and_after() {
+        let naming = |kind: &'static str, name: &str, creates: bool| Naming {
+            kind,
+            name: name.into(),
+            creates,
+            range: 0..1,
+            lines: 1..2,
+        };
+        let routines = FileNaming {
+            file: "routines.sql".into(),
+            kind: AfterKind::Routines,
+            found: vec![
+                naming("trigger", "big_bi", true),
+                naming("trigger", "big_ai", true),
+                naming("procedure", "count_big", false),
+                naming("event", "nightly", false),
+            ],
+            whole: None,
+        };
+        let said = |found: &[FileNaming], as_written, ran| {
+            naming_said(found, "src", "dst", as_written, ran).unwrap()
+        };
+        let before = said(std::slice::from_ref(&routines), false, false);
+        assert_eq!(
+            before,
+            "2 triggers of this backup (“big_bi”, “big_ai”) are written for the database “src”: \
+             restored into “dst” as they are, they would be created in “src”, not in “dst”. \
+             Kerno leaves them out unless you tick “Load them as written”; the tables, their \
+             rows and everything else are loaded. To have those in “dst”, edit routines.sql and \
+             run it there; or restore into a database named “src”. 1 procedure and 1 event \
+             (“count_big”, “nightly”) read or write “src” by name: restored into “dst”, they act \
+             on “src” each time they run."
+        );
+        let after = said(std::slice::from_ref(&routines), false, true);
+        assert!(
+            after.starts_with(
+                "Left out: 2 triggers (“big_bi”, “big_ai”), written for the database “src”: as \
+                 they are, they would have been created in “src”, not in “dst”."
+            ),
+            "{after}"
+        );
+        let chosen = said(std::slice::from_ref(&routines), true, false);
+        assert!(
+            chosen.contains("you chose to load them as written, so they are created in “src”"),
+            "{chosen}"
+        );
+        assert!(!chosen.contains("To have those"), "{chosen}");
+        assert!(
+            said(std::slice::from_ref(&routines), true, true)
+                .starts_with("Loaded as written, into “src”: 2 triggers (“big_bi”, “big_ai”).")
+        );
+        // A file left out whole, with why.
+        let views = FileNaming {
+            file: "views.sql".into(),
+            kind: AfterKind::Views,
+            found: vec![naming("view", "v", true)],
+            whole: Some("mysqldump writes a stand-in for each view first, which would stay".into()),
+        };
+        let whole = said(std::slice::from_ref(&views), false, false);
+        assert_eq!(
+            whole,
+            "views.sql is left out whole, where 1 view (“v”) would write into “src”: Kerno \
+             cannot leave out only those statements (mysqldump writes a stand-in for each view \
+             first, which would stay). To have those in “dst”, edit views.sql and run it there; \
+             or restore into a database named “src”."
+        );
+        // Bodies alone: said, loaded.
+        let reading = FileNaming {
+            found: vec![naming("procedure", "count_big", false)],
+            ..routines.clone()
+        };
+        assert_eq!(
+            said(std::slice::from_ref(&reading), false, true),
+            "1 procedure (“count_big”) reads or writes “src” by name: loaded into “dst”, it acts \
+             on “src” each time it runs."
+        );
+        assert!(naming_said(&[], "src", "dst", false, false).is_none());
+    }
+
+    /// K78: a failure in a file after the tables, every table in: the words
+    /// say what is in place, and a rerun's advice fits the statement (an
+    /// object that already exists in the source, as the pass saw); a view
+    /// of an earlier restore is said to be left as it was.
+    #[test]
+    fn a_failure_after_the_tables_says_what_is_in_place_and_what_a_rerun_does() {
+        let mut manifest = manifest();
+        manifest.database = "src".into();
+        let mut tables = PoolEnd::default();
+        for table in &manifest.tables {
+            for piece in &table.files {
+                tables.states.insert(piece.file.clone(), FileState::Done);
+            }
+        }
+        let mut after = PoolEnd::default();
+        after
+            .states
+            .insert("routines.sql".into(), FileState::Failed);
+        let reason = "ERROR 1359 (HY000) at line 26: Trigger 'src.big_bi' already exists";
+        let reached = Reached {
+            defined: manifest.tables.iter().map(|t| t.table.as_str()).collect(),
+            dropped: Dropped::Read(
+                manifest
+                    .tables
+                    .iter()
+                    .map(|table| (table.table.clone(), Now::Rows))
+                    .collect(),
+            ),
+            views_there: vec!["v1".into()],
+            after_failure: Some((reason, None)),
+        };
+        let text = restore_summary(&manifest, "dst", &tables, Some(&after), &reached);
+        assert!(!text.contains("Run the restore again"), "{text}");
+        assert!(
+            text.contains(
+                "Not loaded either: the routines, triggers and events and the views (“dst” \
+                 already held 1 of them, “v1”: left as it was)."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Every table and its rows are in place. The statement that failed names “src”, \
+                 the database the backup was taken from, not “dst”: as written it acts there. \
+                 What it creates already exists where it names: running the restore again stops \
+                 at the same statement."
+            ),
+            "{text}"
+        );
+        // MySQL 8.4 names no database in its message: the statement Kerno
+        // found at that line of the file says it.
+        let trigger = Naming {
+            kind: "trigger",
+            name: "big_bi".into(),
+            creates: true,
+            range: 0..1,
+            lines: 3..4,
+        };
+        let mysql = "ERROR 1359 (HY000) at line 3 of routines.sql: Trigger already exists";
+        let text = after_advice(mysql, Some(&trigger), "src", "dst");
+        assert!(
+            text.contains(
+                "The statement that failed, the trigger “big_bi”, is written for “src”, the \
+                 database the backup was taken from, not “dst”: as written it acts there."
+            ),
+            "{text}"
+        );
+        // The client's line of a file fed without some lines is the file's.
+        let cut = [(3, 1), (10, 2)];
+        let at = |line: u64| at_file_line(&format!("ERROR 1 at line {line}: x"), "r.sql", &cut);
+        assert_eq!(at(2), ("ERROR 1 at line 2 of r.sql: x".into(), Some(2)));
+        assert_eq!(at(5), ("ERROR 1 at line 6 of r.sql: x".into(), Some(6)));
+        assert_eq!(at(9).1, Some(12));
+        assert_eq!(
+            at_file_line("no line", "r.sql", &cut),
+            ("no line".into(), None)
+        );
     }
 }

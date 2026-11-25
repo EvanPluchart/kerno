@@ -48,9 +48,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    TestSupportExt as _, UniformListScrollHandle, Window, div, px, uniform_list,
+    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, TestSupportExt as _, Window, div, list, px,
 };
 use kerno_core::config::{ConnectParams, ConnectionConfig, Engine, Secret, Secrets, TlsMode};
 use kerno_core::connector::HostKeyStore;
@@ -183,8 +183,16 @@ struct Input {
     /// on this computer: the run needs the explicit opt-in.
     refusal: Option<Finding>,
     /// The database a PostgreSQL archive was made from, which pg_restore
-    /// `--create` creates (from `pg_restore --list`).
+    /// `--create` creates (from `pg_restore --list`); a MySQL / MariaDB
+    /// folder backup's (its manifest), or a plain dump's as its header
+    /// comment names it (K78).
     archive_database: Option<String>,
+    /// A plain MySQL dump that selects a database itself in its first
+    /// lines (`USE `src``, as `mysqldump --databases` writes): that one.
+    dump_uses: Option<String>,
+    /// A folder backup's statements that name its database (K78), read
+    /// once off the UI thread.
+    naming: Vec<mysql_folder::FileNaming>,
     /// A PostgreSQL archive's list (`pg_restore --list`), when it could be
     /// read: what the restore needs is checked from it, and an extension
     /// is left out through it (K39).
@@ -399,7 +407,8 @@ pub struct BackupDialog {
     started: Option<Instant>,
     elapsed: Option<Duration>,
     log: VecDeque<SharedString>,
-    log_scroll: UniformListScrollHandle,
+    /// The log, one item per line, each as tall as its wrapped text (K78).
+    log_list: ListState,
     cancel: Arc<AtomicBool>,
     /// A restore or script fed through the tool's standard input: bytes
     /// sent so far and the file's size (0 until read).
@@ -711,7 +720,7 @@ impl BackupDialog {
             started: None,
             elapsed: None,
             log: VecDeque::new(),
-            log_scroll: UniformListScrollHandle::new(),
+            log_list: ListState::new(0, ListAlignment::Top, px(200.)),
             cancel: Arc::new(AtomicBool::new(false)),
             feed: None,
             close_when_stopped: false,
@@ -941,6 +950,8 @@ impl BackupDialog {
         self.tool_state = ToolState::Probing;
         self.input = None;
         self.preflight = None;
+        // Asked again for each file (K78).
+        self.restore.load_as_written = false;
         self.leave_out.clear();
         if std::mem::take(&mut self.owners_ticked) {
             (self.restore.no_owner, self.restore.no_privileges) = (false, false);
@@ -1316,6 +1327,20 @@ impl BackupDialog {
         settings
             .check(self.engine)
             .map_err(|error| error_text(&error))?;
+        // A folder restore's arguments that Start refuses (K74, F4): a task
+        // saved with them could never start (K78).
+        if let TaskSettings::Restore(options) = &settings
+            && matches!(
+                &self.input,
+                Some(Ok(Input {
+                    manifest: Some(_),
+                    ..
+                }))
+            )
+            && let Some(why) = mysql_folder::restore_refusal(&options.extra_args)
+        {
+            return Err(why);
+        }
         Ok(settings)
     }
 
@@ -2216,7 +2241,7 @@ impl BackupDialog {
                     format!("Restore {file} into {}", self.database)
                 },
                 explanation: format!(
-                    "{}{}",
+                    "{}{}{}",
                     restore_explanation(&Explained {
                         family: self.family,
                         database: &self.database,
@@ -2228,7 +2253,12 @@ impl BackupDialog {
                         restore: &self.restore,
                         into: self.restore_clause(),
                     }),
-                    self.overlap_words()
+                    self.overlap_words(),
+                    // What names the backup's own database, and the choice
+                    // made for it (K78).
+                    self.source_words()
+                        .map(|words| format!(" {words}"))
+                        .unwrap_or_default()
                 ),
                 statement: Statement::Fixed(self.shown(&command)),
                 action: if script { "Run" } else { "Restore" },
@@ -2265,6 +2295,7 @@ impl BackupDialog {
         {
             self.log.push_back(text.into());
         }
+        self.log_list.reset(self.log.len());
         self.roles = None;
         self.step = Step::Running;
         self.showing_clients = false;
@@ -2561,17 +2592,24 @@ impl BackupDialog {
             .collect();
         // Only the lines the log keeps: a script prints one per statement.
         let skip = lines.len().saturating_sub(LOG_LINES);
+        let (before, mut popped, mut added) = (self.log.len(), 0, 0);
         for mut line in lines.into_iter().skip(skip) {
             for secret in &secrets {
                 line = line.replace(secret.as_str(), "•••");
             }
             if self.log.len() == LOG_LINES {
                 self.log.pop_front();
+                popped += 1;
             }
             self.log.push_back(line.into());
+            added += 1;
         }
-        self.log_scroll
-            .scroll_to_item(self.log.len().saturating_sub(1), ScrollStrategy::Bottom);
+        // Only lines that were there before are dropped from the front:
+        // never more than this push adds.
+        self.log_list.splice(0..popped, 0);
+        let kept = before - popped;
+        self.log_list.splice(kept..kept, added);
+        self.log_list.scroll_to_end();
         cx.notify();
     }
 
@@ -2649,13 +2687,20 @@ impl BackupDialog {
                         ("Ran", "in")
                     };
                     format!(
-                        "{program} finished ({}). {done} {} {to} {}.",
+                        "{program} finished ({}). {done} {} {to} {}.{}",
                         status_text(status),
                         self.file
                             .as_deref()
                             .map(|path| path.display().to_string())
                             .unwrap_or_default(),
-                        self.database
+                        self.database,
+                        // A folder restore's statements left out, or loaded
+                        // into the backup's own database (K78).
+                        ended
+                            .said
+                            .as_ref()
+                            .map(|said| format!(" {said}"))
+                            .unwrap_or_default()
                     )
                 };
                 Step::Finished {
@@ -3574,6 +3619,8 @@ fn examine(job: Job) -> Examined {
         format,
         refusal: None,
         archive_database: None,
+        dump_uses: None,
+        naming: Vec::new(),
         list: None,
         extensions: Vec::new(),
         manifest: None,
@@ -3628,10 +3675,16 @@ fn examine(job: Job) -> Examined {
             input.utf8mb4 = manifest
                 .files()
                 .next()
-                .is_some_and(|first| sets_utf8mb4(&file.join(first)));
+                .is_some_and(|first| DumpHead::read(&file.join(first)).utf8mb4);
+            input.naming = mysql_folder::naming(&file, &manifest);
             input.manifest = Some(Arc::new(manifest));
         } else if format == BackupFormat::Sql {
-            input.utf8mb4 = job.engine != Engine::Postgres && sets_utf8mb4(&file);
+            if job.engine != Engine::Postgres {
+                let head = DumpHead::read(&file);
+                input.utf8mb4 = head.utf8mb4;
+                input.archive_database = head.database;
+                input.dump_uses = head.uses;
+            }
             let mut options =
                 RestoreOptions::new(job.engine, job.database, file.clone(), BackupFormat::Sql);
             options.tool_version = install.version.clone();
@@ -3667,16 +3720,50 @@ fn examine(job: Job) -> Examined {
     }
 }
 
-/// Whether a SQL file sets `utf8mb4` in its first lines (`SET NAMES
-/// utf8mb4`, as mysqldump writes it for a server that has it). Blocking.
-fn sets_utf8mb4(path: &Path) -> bool {
-    let mut start = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| {
+/// What a MySQL / MariaDB dump says in its first 4 KB, the only part read
+/// when it is chosen (a dump may be gigabytes).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DumpHead {
+    /// It sets `utf8mb4` (`SET NAMES utf8mb4`, as mysqldump writes it for a
+    /// server that has it).
+    utf8mb4: bool,
+    /// The database its header comment names (`-- Host: … Database: src`):
+    /// the one it was taken from (K78).
+    database: Option<String>,
+    /// The database it selects itself (`USE `src`;`).
+    uses: Option<String>,
+}
+
+impl DumpHead {
+    /// Reads `path`'s head; nothing when it cannot be read. Blocking.
+    fn read(path: &Path) -> Self {
+        let mut start = Vec::new();
+        let read = std::fs::File::open(path).and_then(|file| {
             std::io::Read::read_to_end(&mut std::io::Read::take(file, 4096), &mut start)
-        })
-        .is_ok()
-        && String::from_utf8_lossy(&start).contains("SET NAMES utf8mb4")
+        });
+        if read.is_err() {
+            return Self::default();
+        }
+        Self::of(&String::from_utf8_lossy(&start))
+    }
+
+    fn of(text: &str) -> Self {
+        let database = text
+            .lines()
+            .find(|line| line.starts_with("-- Host: "))
+            .and_then(|line| line.split_once("Database: "))
+            .map(|(_, name)| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let uses = text
+            .lines()
+            .find_map(|line| line.strip_prefix("USE `")?.strip_suffix("`;"))
+            .map(|name| name.replace("``", "`"));
+        Self {
+            utf8mb4: text.contains("SET NAMES utf8mb4"),
+            database,
+            uses,
+        }
+    }
 }
 
 /// A PostgreSQL archive's list, as `pg_restore --list` prints it with the
@@ -5312,12 +5399,54 @@ impl BackupDialog {
         Some(block.into_any_element())
     }
 
+    /// A backup taken from another database than the target, whose
+    /// statements name that database (K78): what they would do and what
+    /// Kerno does with them, and the choice to load them as written.
+    pub(super) fn render_source(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let text = self.source_words()?;
+        let theme = cx.theme();
+        let source = match &self.input {
+            Some(Ok(input)) => input.archive_database.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let choice = self.source_writes().then(|| {
+            Checkbox::new("restore-as-written")
+                .label(SharedString::from(format!(
+                    "Load them as written (they act on “{source}”)"
+                )))
+                .checked(self.restore.load_as_written)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.restore.load_as_written = *checked;
+                    cx.notify();
+                }))
+        });
+        Some(
+            v_flex()
+                .id("restore-source")
+                .test_support()
+                .gap_1()
+                .p_2()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.warning)
+                .child(
+                    div()
+                        .text_sm()
+                        .child(SharedString::from(text.clone()))
+                        .test_text(text),
+                )
+                .children(choice)
+                .into_any_element(),
+        )
+    }
+
     fn render_restore_settings(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let mut rows = self.render_input_file(cx);
         if self.input.is_none() {
             return rows;
         }
         rows.extend(self.render_preflight(cx));
+        rows.extend(self.render_source(cx));
         let r = &self.restore;
         let archive = matches!(&self.input, Some(Ok(input)) if input.format != BackupFormat::Sql);
         let options = match self.family {
@@ -5745,17 +5874,18 @@ impl BackupDialog {
 
     fn render_log(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let list = uniform_list(
-            "backup-log-lines",
-            self.log.len(),
-            cx.processor(|this, range: Range<usize>, _, _| {
-                range
-                    .filter_map(|index| this.log.get(index).cloned())
-                    .map(|line| div().whitespace_nowrap().child(line))
-                    .collect::<Vec<_>>()
+        // A long line wraps within the box, never past its right edge (K78).
+        let list = list(
+            self.log_list.clone(),
+            cx.processor(|this, index: usize, _, _| {
+                let line = this.log.get(index).cloned().unwrap_or_default();
+                div()
+                    .w_full()
+                    .child(line.clone())
+                    .test_text(line)
+                    .into_any_element()
             }),
         )
-        .track_scroll(&self.log_scroll)
         .size_full();
         div()
             .id("backup-log")
@@ -6037,17 +6167,26 @@ impl BackupDialog {
                             button.outline()
                         }
                     };
+                    // Settings a task cannot keep: the save is disabled,
+                    // with why (K78).
+                    let unsaved = self.task_settings(cx).err();
+                    let saving = |button: Button| match &unsaved {
+                        Some(why) => button
+                            .disabled(true)
+                            .tooltip(format!("The task cannot be saved: {why}")),
+                        None => button,
+                    };
                     this.when(self.task().is_some(), |this| {
-                        this.child(
+                        this.child(saving(
                             Button::new("wizard-save-task")
                                 .outline()
                                 .label("Save task")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.save_task(true, window, cx)
                                 })),
-                        )
+                        ))
                     })
-                    .child(
+                    .child(saving(
                         main(Button::new("wizard-save-as-task"), new_task)
                             .label("Save as task…")
                             .on_click(
@@ -6055,7 +6194,7 @@ impl BackupDialog {
                                     this.save_task(false, window, cx)
                                 }),
                             ),
-                    )
+                    ))
                     .child(
                         main(Button::new(start_id), !new_task)
                             .label(start_label)
@@ -6437,6 +6576,8 @@ mod tests {
             format,
             refusal: None,
             archive_database: Some("shop".into()),
+            dump_uses: None,
+            naming: Vec::new(),
             list: None,
             extensions: Vec::new(),
             manifest: None,
@@ -6549,6 +6690,41 @@ mod tests {
         assert_eq!(
             left_out_closed(&five, usize::MAX).unwrap(),
             "Left out, this account may not open them: a, b, c, d, e"
+        );
+    }
+
+    /// K78: what a dump's first lines say, as mysqldump 26.10 writes them:
+    /// the database it was taken from, one it selects itself (`--databases`),
+    /// utf8mb4; nothing from a dump without its comments.
+    #[test]
+    fn a_dump_s_first_lines_name_its_database() {
+        let fixtures = kerno_core::testing::fixtures().join("mysqldump");
+        let head = DumpHead::read(&fixtures.join("k78-maria-fx-routines.sql"));
+        assert_eq!(
+            head,
+            DumpHead {
+                utf8mb4: true,
+                database: Some("kerno_test_k78_fx".into()),
+                uses: None,
+            }
+        );
+        let head = DumpHead::of(
+            "-- Host: localhost    Database: shop\n/*!50503 SET NAMES utf8mb4 */;\n\
+             CREATE DATABASE /*!32312 IF NOT EXISTS*/ `sh``op` ;\n\nUSE `sh``op`;\n",
+        );
+        assert_eq!(head.database.as_deref(), Some("shop"));
+        assert_eq!(head.uses.as_deref(), Some("sh`op"));
+        // Several databases, or no comments: no name.
+        assert_eq!(
+            DumpHead::of("-- Host: localhost    Database: \nSELECT 1;\n").database,
+            None
+        );
+        assert_eq!(
+            DumpHead::of("/*!40101 SET NAMES utf8mb4 */;\n"),
+            DumpHead {
+                utf8mb4: true,
+                ..DumpHead::default()
+            }
         );
     }
 }

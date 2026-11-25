@@ -2025,3 +2025,18 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Proved on the runner, run 45550563294: 0 failures in 200 runs of the test alone, 200 beside its module, 200
   under load, 200 on the macOS runner; the fix's wait taken out, red again in each shape (run 45548327971).
   Here: 200 in 200, `kerno-core` (768), `kerno-mysql --test folder_backup` (18), `ui_tests::mysql_folder` (11).
+
+## 2026-11-25 — K78: a backup that names its own database, restored into another
+
+- The pass in the real app restored a MariaDB folder backup into another database: a trigger created with its
+  database written out was created in the source, not the target (it failed only because the source still had
+  it), and "Run the restore again" failed the same way. Reproduced on MariaDB 11 before the fix: both triggers
+  created in the source, "Done".
+- Now the restore reads `routines.sql` and `views.sql` before it runs (strings and comments aside, K74's quote
+  tracker), says before Start what names the source and what it would do, and leaves out the statements that
+  would write into it unless "Load them as written" is ticked; the end names them and how to have them. Bodies
+  that only name the source are loaded and said. A plain dump's first lines say which database it comes from or
+  selects. A failure in the routines or the views says what is in place and what a rerun does; a stop before
+  the views says which views were left as they were. "Save as task…" is disabled for settings it cannot keep;
+  the log wraps. D-145, M12's K78.
+- Not verified: `mariadb-dump`'s own files, the legacy servers, the real app.

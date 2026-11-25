@@ -571,6 +571,250 @@ fn the_speed_hint_points_only_at_a_row_that_shows(cx: &mut TestAppContext) {
     }
 }
 
+/// K78: a folder backup of `kerno_test_k78_ui_src` whose `routines.sql`
+/// holds a trigger written for that database (as MariaDB keeps one created
+/// with its database's name) and a procedure whose body names it, restored
+/// with the real mysql client on 8.4 into `kerno_test_k78_ui_dst`. Said
+/// before Start in the simple view, the wizard and the confirmation; by
+/// default the trigger is left out (nothing in the source) and named at the
+/// end; "Load them as written" creates it in the source, as written; run so
+/// again, the pass's failure (ERROR 1359) says what is in place, a rerun's
+/// fate and the views already there left as they were, not "Run the restore
+/// again". A plain dump: what its first lines name.
+#[gpui_kit::test]
+fn a_backup_that_names_its_database_is_said_and_left_out_by_default(cx: &mut TestAppContext) {
+    let engine = Engine::MySql;
+    if !testing::available(engine) {
+        return;
+    }
+    let (source, target) = ("kerno_test_k78_ui_src", "kerno_test_k78_ui_dst");
+    let drop = |name: &str| format!("DROP DATABASE IF EXISTS {name}");
+    let _scratch = Scratch::new(
+        engine,
+        &[&drop(source), &drop(target)],
+        &[
+            &format!("CREATE DATABASE {source}"),
+            &format!("CREATE DATABASE {target}"),
+            &format!("CREATE TABLE {source}.big (id INT PRIMARY KEY, n INT)"),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let folder = names_its_database(&root, source);
+    let triggers = |db: &str| {
+        on_server(
+            engine,
+            &format!(
+                "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = '{db}'"
+            ),
+        )
+    };
+
+    let app = connected(cx, engine);
+    let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+    app.wait_backup(cx, &dialog, &["choose a file"]);
+    app.tap(cx, "restore-choose-file");
+    app.answer_open_prompt(cx, &folder);
+    let state = app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+    if !state.starts_with("ready") {
+        eprintln!("SKIPPED: no usable client tool: {state}");
+        return;
+    }
+    app.wait_until(cx, "the database's tables", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    let before = format!(
+        "1 trigger of this backup (“big_bi”) is written for the database “{source}”: restored \
+         into “{target}” as it is, it would be created in “{source}”, not in “{target}”. Kerno \
+         leaves it out unless you tick “Load them as written”; the tables, their rows and \
+         everything else are loaded. To have it in “{target}”, edit routines.sql and run it \
+         there; or restore into a database named “{source}”. 1 procedure (“count_big”) reads or \
+         writes “{source}” by name: restored into “{target}”, it acts on “{source}” each time it \
+         runs."
+    );
+    app.wait_until(cx, "the sentence", |app, cx| paints(app, cx, &before));
+    assert!(app.has(cx, "restore-as-written"));
+    // The wizard says it too, with the same choice.
+    app.tap(cx, "backup-advanced");
+    app.to_settings(cx, &dialog);
+    assert!(paints(&app, cx, &before) && app.has(cx, "restore-as-written"));
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    assert_eq!(painted(&app, cx, &before), 2);
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.contains(&format!(
+            "Left out: 1 trigger (“big_bi”), written for the database “{source}”"
+        )),
+        "{state}"
+    );
+    assert_eq!(
+        (triggers(source), triggers(target)),
+        ("0".into(), "0".into())
+    );
+    assert_eq!(
+        on_server(
+            engine,
+            &format!(
+                "SELECT CONCAT((SELECT COUNT(*) FROM {target}.big), '/', (SELECT COUNT(*) FROM \
+                 information_schema.ROUTINES WHERE ROUTINE_SCHEMA = '{target}'), '/', (SELECT \
+                 COUNT(*) FROM {target}.big_v))"
+            )
+        ),
+        "3/1/3"
+    );
+
+    // Loaded as written: asked again, shown in the confirmation, and the
+    // trigger lands where its statement says.
+    app.tap(cx, "backup-back");
+    app.wait_until(cx, "the tables read again", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    app.tap(cx, "restore-as-written");
+    let chosen = "you chose to load it as written, so it is created in “kerno_test_k78_ui_src”";
+    assert!(paints(&app, cx, chosen));
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    assert_eq!(painted(&app, cx, chosen), 2);
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.contains(&format!(
+            "Loaded as written, into “{source}”: 1 trigger (“big_bi”)."
+        )),
+        "{state}"
+    );
+    assert_eq!(
+        (triggers(source), triggers(target)),
+        ("1".into(), "0".into())
+    );
+
+    // Again as written: the pass's failure, said for what it is.
+    app.tap(cx, "backup-back");
+    app.wait_until(cx, "the tables read again", |_, cx| {
+        cx.update(|cx| dialog.read(cx).target_loaded())
+    });
+    assert!(
+        paints(&app, cx, chosen),
+        "the choice stays for the same file"
+    );
+    app.tap(cx, "restore-start");
+    app.wait_until(cx, "the confirmation", |app, cx| app.has(cx, "sql-preview"));
+    app.tap(cx, "sql-confirm");
+    let state = app.wait_backup(cx, &dialog, &["done", "failed"]);
+    assert!(
+        state.starts_with(
+            "failed: mysql failed on routines, triggers and events: ERROR 1359 (HY000) at line 3 \
+             of routines.sql: "
+        ),
+        "{state}"
+    );
+    let said = format!(
+        "Loaded: “big”. Not loaded either: the routines, triggers and events and the views \
+         (“{target}” already held 1 of them, “big_v”: left as it was). Every table and its rows \
+         are in place. The statement that failed, the trigger “big_bi”, is written for \
+         “{source}”, the database the backup was taken from, not “{target}”: as written it acts \
+         there. What it creates already exists where it names: running the restore again stops \
+         at the same statement."
+    );
+    assert!(
+        state.contains(&said) && !state.contains("Run the restore again"),
+        "{state}"
+    );
+    assert!(paints(&app, cx, &said));
+    app.tap(cx, "backup-close");
+
+    // A plain dump: its header names its database; one that selects a
+    // database itself says so.
+    for (name, head, words) in [
+        (
+            "plain.sql",
+            format!("-- MySQL dump 10.13\n--\n-- Host: 127.0.0.1    Database: {source}\n"),
+            format!(
+                "This dump was taken from the database “{source}”: its triggers, routines, \
+                 events or views that name “{source}” would act on “{source}”, not on “{target}”."
+            ),
+        ),
+        (
+            "uses.sql",
+            format!(
+                "-- MySQL dump 10.13\n--\n-- Host: 127.0.0.1    Database: {source}\n\
+                 CREATE DATABASE /*!32312 IF NOT EXISTS*/ `{source}`;\n\nUSE `{source}`;\n"
+            ),
+            format!(
+                "This dump selects the database “{source}” itself (USE `{source}`): restored, \
+                 what it holds goes into “{source}”, not into “{target}”."
+            ),
+        ),
+    ] {
+        let file = root.join(name);
+        std::fs::write(&file, format!("{head}SELECT 1;\n")).unwrap();
+        let dialog = app.simple_dialog(cx, target, true).expect("the restore");
+        app.wait_backup(cx, &dialog, &["choose a file"]);
+        app.tap(cx, "restore-choose-file");
+        app.answer_open_prompt(cx, &file);
+        app.wait_backup(cx, &dialog, &["ready", "refused", "no tool", "file"]);
+        assert!(paints(&app, cx, &words), "{name}");
+        assert!(!app.has(cx, "restore-as-written"), "{name}");
+        app.tap(cx, "backup-close");
+    }
+}
+
+/// K78: a folder backup of `source`, one table `big`, whose `routines.sql`
+/// holds a trigger written for `source` and a procedure whose body names it,
+/// and a view.
+pub(super) fn names_its_database(root: &std::path::Path, source: &str) -> std::path::PathBuf {
+    let folder = folder_of(root, "k78", &["big"], BackupContent::All, true);
+    std::fs::write(
+        folder.join("0001-big.sql"),
+        "/*!40014 SET FOREIGN_KEY_CHECKS=0 */;\nDROP TABLE IF EXISTS `big`;\n\
+         /*!40101 SET @saved_cs_client     = @@character_set_client */;\n\
+         CREATE TABLE `big` (\n  `id` int NOT NULL,\n  `n` int DEFAULT NULL,\n  PRIMARY KEY \
+         (`id`)\n) ENGINE=InnoDB;\n/*!40101 SET character_set_client = @saved_cs_client */;\n\
+         INSERT INTO `big` VALUES (1,2),(2,4),(3,6);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("routines.sql"),
+        format!(
+            "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\nDELIMITER ;;\n\
+             /*!50003 CREATE*/ /*!50003 trigger {source}.big_bi before insert on {source}.big \
+             for each row set new.n = new.id * 2 */;;\nDELIMITER ;\n\
+             /*!50003 DROP PROCEDURE IF EXISTS `count_big` */;\nDELIMITER ;;\n\
+             CREATE PROCEDURE `count_big`(OUT c INT)\n    READS SQL DATA\n\
+             SELECT COUNT(*) INTO c FROM {source}.big ;;\nDELIMITER ;\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("views.sql"),
+        "/*!50001 DROP VIEW IF EXISTS `big_v`*/;\n\
+         /*!50001 CREATE VIEW `big_v` AS SELECT `id` FROM `big` */;\n",
+    )
+    .unwrap();
+    let mut manifest = mysql_folder::read_manifest(&folder).unwrap();
+    manifest.database = source.into();
+    manifest.after = vec![
+        mysql_folder::AfterFile {
+            file: "routines.sql".into(),
+            kind: mysql_folder::AfterKind::Routines,
+            objects: Vec::new(),
+        },
+        mysql_folder::AfterFile {
+            file: "views.sql".into(),
+            kind: mysql_folder::AfterKind::Views,
+            objects: vec!["big_v".into()],
+        },
+    ];
+    std::fs::write(
+        folder.join(mysql_folder::MANIFEST),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    folder
+}
+
 /// How many painted texts hold `part`.
 fn painted(app: &Fixture, cx: &mut TestAppContext, part: &str) -> usize {
     app.step(cx, |window, _| {
@@ -853,6 +1097,8 @@ fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut
             &format!("CREATE DATABASE {target}"),
             &format!("CREATE TABLE {target}.one (id INT PRIMARY KEY)"),
             &format!("INSERT INTO {target}.one VALUES (1), (2)"),
+            // K78: a view of an earlier restore.
+            &format!("CREATE VIEW {target}.one_v AS SELECT 1 AS x"),
         ],
     );
     let dir = tempfile::tempdir().unwrap();
@@ -882,6 +1128,23 @@ fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut
         )
         .unwrap();
     }
+    // The backup's views, after the tables (K78).
+    std::fs::write(
+        folder.join("views.sql"),
+        "/*!50001 CREATE OR REPLACE VIEW `one_v` AS SELECT 2 AS x */;\n",
+    )
+    .unwrap();
+    let mut manifest = mysql_folder::read_manifest(&folder).unwrap();
+    manifest.after = vec![mysql_folder::AfterFile {
+        file: "views.sql".into(),
+        kind: mysql_folder::AfterKind::Views,
+        objects: vec!["one_v".into()],
+    }];
+    std::fs::write(
+        folder.join(mysql_folder::MANIFEST),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     let app = connected(cx, engine);
     app.use_client(cx, ClientFamily::MySql, &client);
     let dialog = app.simple_dialog(cx, target, true).expect("the restore");
@@ -903,8 +1166,23 @@ fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut
         cx,
         "“--table” is not allowed for a folder restore"
     ));
+    // K78: a task that could never start is not saved either.
+    let saves = |app: &Fixture, cx: &mut TestAppContext| {
+        app.step(cx, |window, _| {
+            window.find("wizard-save-as-task").disabled() != Some(true)
+        })
+    };
+    assert!(!saves(&app, cx));
+    let refused = cx
+        .update(|cx| dialog.read(cx).task_settings(cx))
+        .unwrap_err();
+    assert!(
+        refused.contains("“--table” is not allowed for a folder restore"),
+        "{refused}"
+    );
     app.replace_text(cx, "backup-extra-args", "--force");
     assert!(cx.update(|cx| dialog.read(cx).ready_to_start(cx)));
+    assert!(saves(&app, cx));
 
     // F3: cancelled while the rows wait, every definition run.
     app.tap(cx, "restore-start");
@@ -925,10 +1203,54 @@ fn a_cancelled_restore_says_what_it_left_and_output_options_are_refused(cx: &mut
             && state.contains("Run the restore again"),
         "{state}"
     );
-    assert_eq!(
-        on_server(engine, &format!("SELECT COUNT(*) FROM {target}.one")),
-        "0"
+    // K78: the view already there is said to be as it was, and it is.
+    assert!(
+        state.contains(
+            "Not loaded either: the views (“kerno_test_k74_ui_cancel” already held 1 of them, \
+             “one_v”: left as it was)."
+        ),
+        "{state}"
     );
+    assert_eq!(
+        on_server(
+            engine,
+            &format!(
+                "SELECT CONCAT((SELECT COUNT(*) FROM {target}.one), '/', (SELECT x FROM {target}.one_v))"
+            )
+        ),
+        "0/1"
+    );
+    // K78: the log's long line wraps inside its box (it ran past the right
+    // edge), taller than a line of its own.
+    let (log, lines) = app.step(cx, |window, _| {
+        let log = window.find("backup-log").bounds();
+        let lines: Vec<(String, gpui_kit::Bounds<gpui_kit::Pixels>)> =
+            gpui_kit::base::test_support::texts(window)
+                .into_iter()
+                .filter(|text| text.text().starts_with("Kerno: "))
+                .map(|text| (text.text().to_string(), text.bounds()))
+                .collect();
+        (log, lines)
+    });
+    let short = lines
+        .iter()
+        .find(|(text, _)| text.contains("definitions first"))
+        .map(|(_, bounds)| bounds.size.height)
+        .expect("a short line");
+    let long = lines
+        .iter()
+        .find(|(text, _)| text.contains("Empty now"))
+        .expect("the long line");
+    assert!(
+        long.1.size.height >= short * 2.,
+        "{long:?} against {short:?}"
+    );
+    for (text, bounds) in &lines {
+        assert!(
+            bounds.right() <= log.right(),
+            "{text}: {bounds:?} in {log:?}"
+        );
+    }
 }
 
 /// K74, N4: a saved folder-restore task whose extra arguments are refused

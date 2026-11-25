@@ -1418,6 +1418,12 @@ pub struct RestoreOptions {
     /// [`BackupOptions::utf8mb4`]).
     #[serde(skip)]
     pub utf8mb4: bool,
+    /// A MySQL / MariaDB folder backup restored into another database than
+    /// its own: run as written the statements that would create, drop or
+    /// alter something in the database the backup was taken from (K78),
+    /// which are left out otherwise. Asked at each run, never kept.
+    #[serde(skip)]
+    pub load_as_written: bool,
 }
 
 impl RestoreOptions {
@@ -1447,6 +1453,7 @@ impl RestoreOptions {
             tool_version: None,
             use_list: None,
             utf8mb4: false,
+            load_as_written: false,
         }
     }
 }
