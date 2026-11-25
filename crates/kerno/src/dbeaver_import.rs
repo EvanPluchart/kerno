@@ -289,6 +289,39 @@ impl DbeaverImport {
         cx.notify();
     }
 
+    /// The Kerno connection the scripts of the DBeaver connection `id` go
+    /// to, as [`Self::import`] maps them: one ticked (a new connection,
+    /// named by its row), one already here, the one a repeat repeats, or
+    /// none (a saved query of no connection).
+    fn script_target(&self, id: Option<&str>) -> Option<String> {
+        let index = (self.export.connections.iter()).position(|c| Some(c.id.as_str()) == id)?;
+        match &self.fates[index] {
+            Fate::Import(true) => Some(format!("\u{0}new {index}")),
+            Fate::Exists(id) => Some(id.clone()),
+            Fate::Repeat(first) => self.script_target(Some(&self.export.connections[*first].id)),
+            _ => None,
+        }
+    }
+
+    /// How many saved queries the import would write, and how many it
+    /// skips because they are here already (same connection, folder and
+    /// name), as [`Self::import`] does (K77).
+    fn queries_planned(&self) -> (usize, usize) {
+        let mut known: BTreeSet<(Option<String>, String, String)> = (self.queries.iter())
+            .map(|q| (q.connection_id.clone(), q.folder.clone(), q.name.clone()))
+            .collect();
+        let (mut new, mut here) = (0, 0);
+        for script in &self.export.scripts {
+            let target = self.script_target(script.connection.as_deref());
+            if known.insert((target, script.folder.clone(), script.name.clone())) {
+                new += 1;
+            } else {
+                here += 1;
+            }
+        }
+        (new, here)
+    }
+
     /// Writes what is ticked: folders, connections, their passwords when
     /// asked, and the scripts.
     pub fn import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -644,10 +677,15 @@ impl DbeaverImport {
             );
         }
         items.extend(in_folder(None).into_iter().map(|index| row(index, 0)));
+        let (queries_new, queries_here) = self.queries_planned();
         let mut scripts = format!(
             "{} come with them, as saved queries of their connection.",
             count(self.export.scripts.len(), "script", "scripts")
         );
+        // A saved query already here is skipped, as a connection is (K77).
+        if queries_here > 0 {
+            scripts.push_str(&format!(" Already here, skipped: {queries_here}."));
+        }
         if !self.export.skipped_scripts.is_empty() {
             scripts.push_str(&format!(
                 " Skipped (over 1 MB): {}.",
@@ -667,8 +705,17 @@ impl DbeaverImport {
             .iter()
             .filter(|fate| **fate == Fate::Import(true))
             .count();
-        // Nothing ticked: the button is off and the dialog says why (K77).
-        let nothing = (chosen == 0).then(|| {
+        let folders_new = (self.export.folders.iter())
+            .filter(|folder| {
+                !AppState::get(cx)
+                    .settings
+                    .connection_folders
+                    .contains(*folder)
+            })
+            .count();
+        // Nothing to write at all: the button is off and the dialog says why;
+        // saved queries or folders alone are imported (K77).
+        let nothing = (chosen == 0 && queries_new == 0 && folders_new == 0).then(|| {
             let fates = || self.fates.iter();
             if fates().any(|fate| *fate == Fate::Import(false)) {
                 "Nothing is ticked: tick the connections to import."
@@ -721,7 +768,8 @@ impl DbeaverImport {
                 .test_support()
                 .text_xs()
                 .text_color(muted)
-                .child(SharedString::from(scripts))
+                .child(SharedString::from(scripts.clone()))
+                .test_text(scripts)
                 .into_any_element(),
             v_flex()
                 .gap_1()
@@ -768,11 +816,12 @@ impl DbeaverImport {
                 .child(
                     Button::new("dbeaver-import")
                         .primary()
-                        .label(SharedString::from(format!(
-                            "Import {}",
-                            count(chosen, "connection", "connections")
+                        .label(SharedString::from(import_label(
+                            chosen,
+                            queries_new,
+                            folders_new,
                         )))
-                        .disabled(chosen == 0)
+                        .disabled(nothing.is_some())
                         .on_click(cx.listener(|this, _, window, cx| this.import(window, cx))),
                 )
                 .into_any_element(),
@@ -783,6 +832,23 @@ impl DbeaverImport {
         }
         body
     }
+}
+
+/// What the Import button writes: its connections, or with none ticked
+/// what else it writes ("Import 3 saved queries"), K77.
+fn import_label(connections: usize, queries: usize, folders: usize) -> String {
+    if connections > 0 || queries + folders == 0 {
+        return format!("Import {}", count(connections, "connection", "connections"));
+    }
+    let parts: Vec<String> = [
+        (queries, "saved query", "saved queries"),
+        (folders, "folder", "folders"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| count(n, one, many))
+    .collect();
+    format!("Import {}", parts.join(" and "))
 }
 
 /// "3 connections", "1 script".

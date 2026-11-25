@@ -1992,9 +1992,11 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   learns of it (the open nodes from the model, the selected row, the scroll) and put back as the new sessions
   read: each node opens as an expand reads it, a node gone is not there, a failed read shows its row as before;
   the row is selected again unless another was chosen meanwhile. D-144 amended (K75's "not chosen" reversed).
-- The DBeaver import and the connections file import turn their Import button off when nothing would be written
-  and say why in a line beside it ("Nothing to import: every connection Kerno can take from this file is already
-  here.", "Nothing is ticked: …").
+- The DBeaver import and the connections file import turn their Import button off only when nothing at all would
+  be written, and say why in a line beside it ("Nothing to import: every connection Kerno can take from this file
+  is already here.", "Nothing is ticked: …"). With no connection ticked, a DBeaver project's scripts and folders
+  not here yet are still imported (as before), the button saying so ("Import 1 saved query"); a second import
+  writes no saved query twice (already so, now tested), and the preview says how many are already here.
 - "Fill with test data": a disabled NULL % field's text is given a disabled button's colour (the muted grey at
   half), which the field dims again: fainter than the button's, in both themes; the connection dialog the request
   named has no disabled field (D-102), so the kit's disabled button on the same line was the reference. A SQLite

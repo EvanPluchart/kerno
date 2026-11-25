@@ -207,17 +207,18 @@ sent and never shows them. A saved password is linked automatically only to a co
 already has, pointing at the same server (SSH tunnel included); otherwise you choose, and a connection left
 unlinked cannot read any of the old secrets. Files written by earlier versions still import.
 
-**Import from DBeaver…** (File menu, the sidebar's menu, the palette) takes a DBeaver project export (in
-DBeaver, File ▸ Export ▸ Project: a `.dbp` file) or a `data-sources.json`. It lists the folders and their
-connections, ticked, or greyed with the reason; untick what you do not want, then Import. The scripts become
-saved queries of their connection. **Also import the saved passwords** (off by default) puts them in this
-computer's secret store. Importing the same file again adds nothing twice: with nothing ticked, or every
-connection already here, the Import button is off and the dialog says why (so does a connections file whose
-items are all here already). An SSH tunnel's jump servers come
-as its jump hosts (through the system's OpenSSH). Under each connection the preview says what was left out and
-what to check ("To check: certificate pasted in DBeaver, not in a file: save it to a file and choose it on the
-SSL tab"), and the report after the import lists them again, connection by connection. A PostgreSQL
-connection shows the databases DBeaver showed (see the next section).
+**Import from DBeaver…** (File menu, the sidebar's menu, the palette) takes a DBeaver project export (in DBeaver,
+File ▸ Export ▸ Project: a `.dbp` file) or a `data-sources.json`. It lists the folders and their connections,
+ticked, or greyed with the reason; untick what you do not want, then Import. The scripts become saved queries of
+their connection. **Also import the saved passwords** (off by default) puts them in this computer's secret store.
+Importing the same file again adds nothing twice: a saved query already here (same connection, folder and name)
+is skipped, and the preview says how many. With no connection ticked, the scripts and folders not here yet are
+still imported, the button saying so ("Import 1 saved query"); when nothing at all would be written, the button
+is off and the dialog says why (so does a connections file whose items are all here already). An SSH tunnel's
+jump servers come as its jump hosts (through the system's OpenSSH). Under each connection the preview says what
+was left out and what to check ("To check: certificate pasted in DBeaver, not in a file: save it to a file and
+choose it on the SSL tab"), and the report after the import lists them again, connection by connection. A
+PostgreSQL connection shows the databases DBeaver showed (see the next section).
 
 ## Which databases a PostgreSQL connection shows
 

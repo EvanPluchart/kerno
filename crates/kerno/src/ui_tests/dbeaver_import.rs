@@ -167,8 +167,13 @@ fn a_dbeaver_project_is_previewed_then_imported_once(cx: &mut TestAppContext) {
     let (blog_id, _) = app.by_name("Blog");
     assert!(!secrets::has_secrets(store.as_ref(), &blog_id).unwrap());
 
-    // K77: a third time nothing is left to import: the button is off and the dialog says why.
+    // K77: a third time nothing is left to import, no saved query twice: the button is off and
+    // the dialog says why.
     let view = app.dbeaver_preview(cx, path);
+    assert!(
+        super::ai_endpoints::text_of(&app, cx, "dbeaver-scripts")
+            .ends_with("Already here, skipped: 3.")
+    );
     assert_eq!(
         super::ai_endpoints::text_of(&app, cx, "dbeaver-nothing"),
         "Nothing to import: every connection Kerno can take from this file is already here."
@@ -180,21 +185,39 @@ fn a_dbeaver_project_is_previewed_then_imported_once(cx: &mut TestAppContext) {
     app.click(cx, "dbeaver-cancel");
 }
 
-/// K77: with every connection unticked, Import is off and the dialog says that nothing is ticked;
-/// ticking one turns it on.
+/// K77: with every connection unticked, the scripts and the folders are still imported (as
+/// before K77), the button saying so; once they are here too, Import is off and the dialog says
+/// that nothing is ticked; ticking one turns it on.
 #[gpui_kit::test]
-fn nothing_ticked_imports_nothing_and_says_so(cx: &mut TestAppContext) {
+fn nothing_ticked_imports_the_scripts_then_nothing_and_says_so(cx: &mut TestAppContext) {
     let app = open(cx, memory_storage());
     let dir = tempfile::tempdir().unwrap();
-    let view = app.dbeaver_preview(cx, project_file(&dir));
-    assert!(!app.has(cx, "dbeaver-nothing"));
-    cx.update(|cx| {
-        view.update(cx, |view, cx| {
-            for index in 0..5 {
-                view.set_ticked(index, false, cx);
-            }
+    let path = project_file(&dir);
+    let untick = |cx: &mut TestAppContext, view: &Entity<DbeaverImport>| {
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                for index in 0..5 {
+                    view.set_ticked(index, false, cx);
+                }
+            })
         })
+    };
+    let view = app.dbeaver_preview(cx, path.clone());
+    untick(cx, &view);
+    assert!(!app.has(cx, "dbeaver-nothing"));
+    assert_eq!(
+        app.label_of(cx, "dbeaver-import"),
+        "Import 3 saved queries and 3 folders"
+    );
+    app.click(cx, "dbeaver-import");
+    app.wait_until(cx, "the import", |_, cx| {
+        cx.update(|cx| view.read(cx).summary()).starts_with("done")
     });
+    assert!(app.storage.connections().unwrap().is_empty());
+    assert_eq!(app.storage.saved_queries().unwrap().len(), 3);
+
+    let view = app.dbeaver_preview(cx, path);
+    untick(cx, &view);
     assert_eq!(
         super::ai_endpoints::text_of(&app, cx, "dbeaver-nothing"),
         "Nothing is ticked: tick the connections to import."
@@ -202,7 +225,7 @@ fn nothing_ticked_imports_nothing_and_says_so(cx: &mut TestAppContext) {
     app.click(cx, "dbeaver-import");
     let summary = cx.update(|cx| view.read(cx).summary());
     assert!(summary.starts_with("preview |"), "{summary}");
-    assert!(app.storage.connections().unwrap().is_empty());
+    assert_eq!(app.storage.saved_queries().unwrap().len(), 3);
     cx.update(|cx| view.update(cx, |view, cx| view.set_ticked(1, true, cx)));
     assert!(!app.has(cx, "dbeaver-nothing"));
     app.click(cx, "dbeaver-import");
@@ -210,6 +233,52 @@ fn nothing_ticked_imports_nothing_and_says_so(cx: &mut TestAppContext) {
         cx.update(|cx| view.read(cx).summary()).starts_with("done")
     });
     assert_eq!(app.storage.connections().unwrap().len(), 1);
+}
+
+/// K77: a project whose connections are all here already, with a script that is not (written
+/// in DBeaver since the last import), imports that script alone: the button on, saying so.
+#[gpui_kit::test]
+fn a_new_script_of_a_project_already_here_is_imported_alone(cx: &mut TestAppContext) {
+    let app = open(cx, memory_storage());
+    let dir = tempfile::tempdir().unwrap();
+    let path = project_file(&dir);
+    let view = app.dbeaver_preview(cx, path.clone());
+    app.dbeaver_import(cx, &view);
+    let (shop_id, _) = app.by_name("Shop");
+    let monthly = (app.storage.saved_queries().unwrap().into_iter())
+        .find(|query| query.name == "monthly")
+        .unwrap();
+    app.storage.delete_query(monthly.id).unwrap();
+
+    let view = app.dbeaver_preview(cx, path);
+    let summary = cx.update(|cx| view.read(cx).summary());
+    assert!(
+        summary.contains(&format!("Shop Exists(\"{shop_id}\")")),
+        "{summary}"
+    );
+    assert!(!app.has(cx, "dbeaver-nothing"));
+    assert_eq!(app.label_of(cx, "dbeaver-import"), "Import 1 saved query");
+    assert!(
+        super::ai_endpoints::text_of(&app, cx, "dbeaver-scripts")
+            .ends_with("Already here, skipped: 2.")
+    );
+    app.click(cx, "dbeaver-import");
+    app.wait_until(cx, "the import", |_, cx| {
+        cx.update(|cx| view.read(cx).summary()).starts_with("done")
+    });
+    let done = cx.update(|cx| view.read(cx).summary());
+    assert!(
+        done.contains("Imported 0 connections and 1 saved query"),
+        "{done}"
+    );
+    assert_eq!(app.storage.connections().unwrap().len(), 4);
+    let queries = app.storage.saved_queries().unwrap();
+    assert_eq!(queries.len(), 3);
+    assert!(
+        queries
+            .iter()
+            .any(|q| q.name == "monthly" && q.connection_id.as_deref() == Some(shop_id.as_str()))
+    );
 }
 
 /// K71: a connection written to the store a moment before (an import just
