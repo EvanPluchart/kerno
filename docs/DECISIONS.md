@@ -5237,21 +5237,22 @@ from the app (CLAUDE.md §3 item 12), "as in the owner's other apps Recto and Vi
 
 The owner's pick "A5": on Windows a connection tunnels through `ssh.exe` as it does through `ssh` on macOS and
 Linux since J2 (D-056). An independent review of the first version found twelve points (K69's R1 to R12 in
-`docs/plans/M12.md`); this is the decision as it stands after them.
+`docs/plans/M12.md`), its second reading seven more (S1 to S7), the runner two more (a chain's last `ssh.exe`,
+a profile named with "É"); this is the decision as it stands after them.
 
 **The security model, in one table.**
 
 | What | How it is decided | Who can reach it / what proves it |
 |---|---|---|
-| The `ssh.exe` run | `C:\Windows\System32\OpenSSH\ssh.exe` when `SystemRoot` is exactly `C:\Windows`, then `C:\Program Files\OpenSSH\ssh.exe` when `ProgramFiles` is exactly `C:\Program Files` (`tools::system_program`, `openssh::installed_ssh`); never `PATH` | Folders only administrators change; a value a process of the user's set (before Kerno is started as administrator) is not followed. A Windows installed elsewhere than `C:\Windows` gets no system OpenSSH ("Windows' OpenSSH client is not installed…", the built-in client) |
+| The `ssh.exe` run | `C:\Windows\System32\OpenSSH\ssh.exe` when `SystemRoot` is exactly `C:\Windows`, then `C:\Program Files\OpenSSH\ssh.exe` when `ProgramFiles` is exactly `C:\Program Files` (`tools::system_program`, `openssh::installed_ssh`); never `PATH`. A jump host's `ssh.exe` is started by `ssh.exe` itself (`-J`): Windows' OpenSSH writes it as `"<argv[0]>" … -F <file> -W … <jump>`, `argv[0]` quoted (its `ssh.c`, the `WINDOWS` branch; the fall-back to a plain `ssh` is left out there), and `argv[0]` is the absolute path Kerno started (Rust writes the program as given) | Folders only administrators change; a value a process of the user's set (before Kerno is started as administrator) is not followed. A Windows installed elsewhere than `C:\Windows` gets no system OpenSSH ("Windows' OpenSSH client is not installed…", the built-in client). On the runner every `ssh.exe` of a tunnel, through a chain of two jump hosts and from a copy of OpenSSH under a folder with a space, is the chosen file by `Win32_Process.ExecutablePath`, each reading the tunnel's `-F` (S1) |
 | The stream to PostgreSQL | One `ssh.exe -W host:port` per stream, its standard input and output | Nothing listens on the computer |
 | The stream to MySQL/MariaDB, and the client tools (`pg_dump.exe`, `mysqldump.exe`, …) | `Tunnel::forward_once`: a loopback port that admits one connection, then the stream above | Any local account can connect to that port in the moment between Kerno opening it and the driver connecting (`ssh.rs`, unchanged since v1); the database's own login is still needed. `mysql_async` dials an address and takes no stream, and a tool is a separate program: neither can take the pipes |
 | The tunnel's private folder | `AppPaths::local_data_dir()\ssh\kerno-ssh-<12 hex>` (`%LOCALAPPDATA%\Kerno\data\ssh`, in the profile), whatever `TEMP` and `KERNO_DATA_DIR` say; removed at the tunnel's end | The profile's access list: the user, SYSTEM, the administrators. Kerno holds its two files open with `FILE_SHARE_READ` while the tunnel lives: others may read them, not write or delete them |
 | Its `config` (`-F`) | Kerno's own: `LogLevel INFO`, no password, no keyboard-interactive, `BatchMode no`, then `Include` of the user's file and the system's | `ssh.exe` runs in the folder's parent with `-F kerno-ssh-…/config`: OpenSSH writes `-F` unquoted in a jump host's command, and that relative path has no space whatever the profile's name |
-| The questions (`SSH_ASKPASS`) | Kerno itself (`kerno.exe`, a windowed program), `SSH_ASKPASS_REQUIRE=force` | Over a named pipe (random name, local peers only, first instance) whose two ends prove they read the token in the folder's `ask` file (the running instance's handshake, D-131) before a byte crosses. The environment carries the file's path and the asking `ssh`'s number, never the token or the passphrase |
-| Another account and the pipe | Each peer in a task of its own, at most 8 at once, 10 s each | It can open the pipe for reading (a pipe's default access list) and take some of the 8 places: a denial of service, as D-131 accepted. It can neither receive the passphrase nor answer the helper (no proof) |
+| The questions (`SSH_ASKPASS`) | Kerno itself (`kerno.exe`, a windowed program), `SSH_ASKPASS_REQUIRE=force`, its path spelled in ASCII (relative to where `ssh.exe` runs when the profile's name has another letter; see below) | Over a named pipe (random name, local peers only, first instance) whose two ends prove they read the token in the folder's `ask` file (the running instance's handshake, D-131) before a byte crosses. The environment carries the file's path and the asking `ssh`'s number, never the token or the passphrase |
+| Another account and the pipe | Each peer in a task of its own, at most 8 at once, the next one waiting its turn; a peer's nonce waited for 1 s, the whole exchange 10 s (the same on the instance's pipe, S2) | It can open the pipe for reading (a pipe's default access list) and take the 8 places a second at a time: a proved peer waits about a second, never dropped. It can neither receive the passphrase nor answer the helper (no proof) |
 | The passphrase | From the secret store; tried on the key file first (`passphrase_opens`, ssh-key's `decrypt`) | Never in an argument, the environment or a log. Answered only while the asking `ssh` is still logging in: once its login line is seen, its later questions are refused. Kept in memory for the tunnel's life (each `ssh.exe` asks again) |
-| A file named by a connection or a task | `local_path::resolve`: `~\` put under the home, then an allow-list: a drive's absolute path or `~\…`, no further `:`, no device name (`CON`, `NUL`, `COM1`…), no NUL | Checked where it is used: the three drivers' connect (TLS files, the SQLite database), the tools' TLS options and a task's output folder, backup file and script, both SSH clients' key, `ssh.exe`'s `-i` and `IdentityAgent` (a pipe of this computer), the password command's program, the `Include`s Kerno reads to list aliases; the dialog, the backup wizard and the imports say it early |
+| A file named by a connection or a task | `local_path::resolve`: `~\` put under the home, then an allow-list: a drive's absolute path or `~\…`, no further `:`, no device name (`CON`, `NUL`, `COM1`…), no NUL | Checked where it is used: the three drivers' connect (TLS files, the SQLite database), the tools' TLS options and a task's output folder, backup file and script, the MySQL folder backup's folder (before it is made or its manifest read), both SSH clients' key, `ssh.exe`'s `-i` and `IdentityAgent` (a pipe of this computer), the password command's program, the `Include`s Kerno reads to list aliases; the dialog, the backup wizard (`~\` expanded before the folder is judged, S4) and the imports say it early |
 
 **The forward.** A loopback `-L` would keep the shape of `openssh/unix.rs` (one login for every session) but
 open a port every local account can reach while the tunnel is up, that a squatter can take between Kerno
@@ -5278,10 +5279,13 @@ for the first connection (a timer retires it; a server closes a connection that 
 **The passphrase, per `ssh`.** Windows' std has no parent id, so the helper names the `ssh` that asks by the
 number Kerno gave it (`KERNO_ASKPASS_SPAWN`); questions and what they told are kept per `ssh`
 (`Observed`, R9). A passphrase Kerno verified on the key file answers every question for that key (a jump
-host's `ssh` asks on its own); one it could not try (a PEM or PKCS#8 key) is given once per `ssh`, and a
-second question from the same `ssh` says "the passphrase is wrong" (R8). Edge: a PEM key that a jump host and
-its target both use is then said wrong (the jump host's question and the target's share a number). The
-passphrase question is matched exactly as on Unix: `ssh.exe` names the key as it was given.
+host's `ssh` asks on its own); one it could not try (a PEM or PKCS#8 key) is given once per hop of a stream
+(its `ssh` and one per jump host of the field: the jump host's `ssh` inherits the stream's number), and a
+question beyond that says "the passphrase is wrong" (R8, S5). Limit: a jump host the user's config adds
+(`ProxyJump` there, not in the field) is not counted, and a PEM key used on that hop too is then said wrong.
+The key the question names is compared with `\` and `/` alike and ASCII case folded on Windows (S6:
+`~/.ssh/id` expands to `C:\Users\x/.ssh/id`, and a jump host's `IdentityFile` may use either), exactly on
+Unix.
 
 **Too old.** An `ssh.exe` before 8.4 ignores `SSH_ASKPASS_REQUIRE` (8.4's release notes, as recalled): when
 it fails and none of its questions reached Kerno, the failure says "This OpenSSH is too old to ask Kerno for a
@@ -5290,11 +5294,35 @@ only). Not proved end to end: the runner has 9.5, and an older `ssh.exe` could n
 download. Windows 10 shipped 7.7 and later 8.1, as recalled.
 
 **Every `ssh.exe` goes.** A jump host's `ssh.exe` outlived its parent on the runner (Windows stops no child
-with its parent). A stream's tree is stopped with System32's `taskkill /T /F /PID` before the process itself,
-at a stream's drop, a failed start and a cancelled one; the pids of the trees not stopped yet are listed (only
-while Kerno holds their handles, so no pid is reused meanwhile), and the app's quit stops them all and waits
-(`openssh::stop_all`). A crash stops nothing: without a job object (it needs `unsafe`) the `ssh.exe` of the
-open sessions stay until their server closes them or the user logs out, visible in Task Manager, harmless.
+with its parent). With a chain of two jump hosts the innermost `ssh.exe` stayed, holding its connection to
+the first jump host (seen on the runner, and again with the tree read whole first): a dropped stream closed
+its pipes at once, the stream's `ssh.exe` saw its input end and left by itself, stopping only its own jump
+host's `ssh.exe` (`TerminateProcess`, which leaves that one no time to stop its own); the innermost was then
+under nothing. So a stream's pipes stay open until its tree is stopped (`Tree` holds them), and the tree is
+read whole first, while every hop lives: System32's PowerShell lists the `ssh.exe` processes with their parent
+and start time (`Get-CimInstance Win32_Process`), and the tree is every process whose parent is in it and that
+started after that parent (Windows keeps a dead parent's id, which a later process may get; `openssh::tree`);
+then System32's `taskkill /T /F` stops each, at a stream's drop, a failed start and a cancelled one (a second
+of PowerShell, off the UI thread), and the pipes close. Any depth: a chain of three jump hosts is tested. The pids of the trees not stopped yet are listed (only while Kerno holds their handles, so no pid is
+reused meanwhile), and the app's quit lists once and stops them all, waiting (`openssh::stop_all`, the list
+locked across its kills, a stream's handle dropped under the same lock: S3). A middle hop that died on its own
+before the stream ends leaves its own children out of the listing's tree. A crash stops nothing: without a
+job object (it needs `unsafe`) the `ssh.exe` of the open sessions stay until their server closes them or the
+user logs out, visible in Task Manager.
+
+**A profile named with a letter beyond ASCII.** Windows' OpenSSH reads `SSH_ASKPASS` with the C runtime's
+`getenv` (the ANSI code page) and starts it as UTF-8 (`posix_spawnp`, `CreateProcessW`), so a helper under
+`C:\Users\Élodie\…` named no file: `CreateProcessW failed error:2`, then "Permission denied" (seen on the
+runner, with the console helper and with the release `kerno.exe`). Only that variable: the command line
+(`-i`, `-F`), the `Include`d files and `KERNO_ASKPASS` (read by Kerno from the wide environment) take any
+letter. Kerno gives the helper's path as it is when it is ASCII; else relative to the folder `ssh.exe` runs in
+(the tunnels' folder, which every hop inherits), which climbs out of the profile with `..`: an install in
+`%LOCALAPPDATA%\Programs\Kerno` beside `%LOCALAPPDATA%\Kerno` is `..\..\..\Programs\Kerno\kerno.exe`
+(`openssh::askpass_spelling`). When no ASCII spelling exists (the helper's own folders below the common one
+have such a letter, or another drive), the tunnel still runs (an agent and a recorded host key ask nothing),
+and a failure begins "Windows' OpenSSH cannot start Kerno's helper from a folder whose name has the letter
+“É”.", with the next step: the agent (`ssh-add`), the built-in client, or a folder with plain letters. Nothing
+is copied elsewhere (a folder other accounts can write would let them replace the helper).
 
 **Files of another computer.** On Windows a path such as `\\host\share\x` (any spelling: `//host`, `\/host`,
 `\\?\UNC\…`, `\??\…`, a device path) is opened over SMB with the user's Windows credentials, by Kerno or by a

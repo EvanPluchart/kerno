@@ -117,8 +117,12 @@ a named pipe whose two ends prove they can read a token in the tunnel's private 
 `%LOCALAPPDATA%\Kerno\data\ssh`, removed when the connection closes), and only while that `ssh.exe` logs in;
 the passphrase is kept in memory while the connection is open. A wrong passphrase is said as wrong. An
 `ssh.exe` older than 8.4 cannot ask Kerno anything: load the key in the agent (`ssh-add`), connect once with
-`ssh` in a terminal to record the server's key, or use the built-in client. ControlMaster and Pageant are not
-used. Kerno opens no file of another computer named in a connection or a saved task (a key, a certificate, a
+`ssh` in a terminal to record the server's key, or use the built-in client. Windows' OpenSSH cannot start a
+program whose path has a letter beyond A to Z (`C:\Users\Élodie\…`): Kerno names itself to it by a path
+relative to the tunnel's folder, which works for an install in `%LOCALAPPDATA%\Programs\Kerno`; installed in
+a folder whose own name has such a letter, the failure says so first, with the same three ways out. Every
+`ssh.exe` of a connection, its jump hosts' included, stops when the connection closes or Kerno quits.
+ControlMaster and Pageant are not used. Kerno opens no file of another computer named in a connection or a saved task (a key, a certificate, a
 SQLite database, a backup's folder at `\\server\share\…`): Windows would log in there with your account. Use a
 path such as `C:\Users\you\…` or `~\…`; for a database on a share, map the share to a drive letter first. When
 you import connections, each saved task shows the files it would read or write before you save it.

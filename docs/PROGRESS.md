@@ -1968,3 +1968,15 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
 - Proved on a throwaway Windows runner (the probe workflow of the branch `windows-ssh`, not merged) against
   Windows' own OpenSSH server, a PostgreSQL 17 and a MySQL 8.4 the workflow starts; macOS unchanged, the J2
   tests green against `kerno-ssh` and `kerno-ssh-jump`.
+
+## 2026-11-25 — K69: the second reading, and what the runner found
+
+- The second reading's seven points (S1 to S7 in `docs/plans/M12.md`): every `ssh.exe` of a tunnel, a
+  chain's hops included, checked on the runner to be the chosen file; a crowded askpass pipe makes a proved
+  peer wait, never drops it; a PEM key answered once per hop; the key known in either separator; the release
+  step tests `kerno.exe` or fails.
+- The runner found two more: a chain's last `ssh.exe` outlived its stream (the pipes closed before the tree
+  was stopped: now they close after, the tree read whole first), and Windows' OpenSSH cannot start a helper
+  whose path has "É" (Kerno names itself in ASCII, relative to the tunnels' folder; where it cannot, the
+  failure says so first).
+- Proved by run 45521821890 on the code, every step green; a red run with six mutations.
