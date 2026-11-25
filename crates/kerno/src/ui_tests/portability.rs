@@ -22,6 +22,14 @@ use kerno_core::tools::{BackupOptions, TaskSettings};
 use super::*;
 use crate::portability::{ImportSetup, Part};
 
+/// The folder the saved task writes to: a full path of this system (on
+/// Windows a path without a drive gets a note, which is another test's).
+const DUMPS: &str = if cfg!(windows) {
+    r"C:\kerno_ui dumps"
+} else {
+    "/tmp/kerno_ui dumps"
+};
+
 const SSH_SECRET: &str = "kerno-ui-ssh-secret";
 const PASSPHRASE: &str = "kerno-ui-key-passphrase";
 const CLIENT_DIR: &str = "/Users/kerno-ui/secret-client-dir";
@@ -106,7 +114,7 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
     let command_id = storage.save_connection(None, &command).unwrap();
     // A folder the preview shows before the task is saved (K69).
     let mut backup = BackupOptions::new(Engine::Postgres, "kerno");
-    backup.output_folder = PathBuf::from("/tmp/kerno_ui dumps");
+    backup.output_folder = PathBuf::from(DUMPS);
     let mut task = SavedTask::new("kerno_ui nightly", &linked_id, TaskSettings::Backup(backup));
     task.description = "kerno_ui backup".into();
     storage.save_task(&task).unwrap();
@@ -196,9 +204,7 @@ fn everything_moves_to_a_fresh_data_directory_without_a_secret(
     assert!(other.has(fresh, ("import-task-files", 0usize)));
     assert_eq!(
         fresh.update(|cx| preview.read(cx).task_notes()),
-        [Some(
-            "Writes its backups to /tmp/kerno_ui dumps.".to_string()
-        )]
+        [Some(format!("Writes its backups to {DUMPS}."))]
     );
     other.click(fresh, "import-next");
     // The command needs no password: two rows. The entry found under the
