@@ -2053,3 +2053,7 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   definitions' run naming the table it stopped in, "Nothing was run." only when nothing reached the tool.
 - The review's second run: a `USE` after another statement on its line, or behind a comment, also switched
   the session; any statement that starts with `USE` or `CONNECT` now leaves its file out whole (D-145).
+- After K79, the stand-in client tools of the UI tests (`fake_tool`) read their input to the end, as a real
+  client reads its script: one that never read it ended before or after Kerno had written it, by chance, and
+  a run then failed rightly ("stopped reading before the end…") on a slow runner
+  (`a_script_task_asks_before_each_run…` on the Linux job).

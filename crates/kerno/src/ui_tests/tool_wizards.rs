@@ -14,14 +14,19 @@ use super::*;
 use crate::backup_dialog::{self, BackupDialog, Mode};
 
 /// A stand-in for a client tool: a shell script that prints `version` for
-/// `--version` and otherwise runs `body`.
+/// `--version` and otherwise runs `body`. However `body` ends, the script
+/// then reads its input to the end, as a real client reads its script: a
+/// tool that ends well with part of its input unread fails the run (K79),
+/// and a stand-in that never read it would end before or after Kerno wrote
+/// it, by chance.
 fn fake_tool(dir: &Path, name: &str, version: &str, body: &str) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(name);
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\n{body}\n"
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\n\
+             trap 'cat > /dev/null' EXIT\n{body}\n"
         ),
     )
     .unwrap();
