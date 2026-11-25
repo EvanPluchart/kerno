@@ -900,6 +900,13 @@ fn tree(rows: &[ProcessRow], roots: &[u32]) -> Vec<u32> {
 /// helper's own folders below the common one are (an install under
 /// `%LOCALAPPDATA%\Programs` beside the tunnels' `%LOCALAPPDATA%\Kerno`);
 /// `Err` with the first other letter when no ASCII spelling exists.
+///
+/// A relative spelling always begins with `.\` or `..\` (T1): Windows
+/// resolves such a name against the current folder only, while a relative
+/// name like `Kerno\kerno.exe` is looked for first in the folder of the
+/// program that starts it (`CreateProcessW`'s search), which another
+/// account might control. The runner proves which file runs
+/// (`openssh_windows::a_relative_helper_is_never_taken_from_ssh_exe_s_folder`).
 #[cfg(any(windows, test))]
 fn askpass_spelling(askpass: &Path, base: &Path) -> Result<OsString, char> {
     let first_other = |path: &Path| path.to_string_lossy().chars().find(|c| !c.is_ascii());
@@ -924,8 +931,9 @@ fn askpass_spelling(askpass: &Path, base: &Path) -> Result<OsString, char> {
     if common == 0 || !askpass.is_absolute() || !base.is_absolute() {
         return Err(letter);
     }
-    let mut relative = PathBuf::new();
-    for _ in common..from.len() {
+    // `.` first when nothing is climbed: never a name searched elsewhere.
+    let mut relative = PathBuf::from(if common == from.len() { "." } else { ".." });
+    for _ in common + 1..from.len() {
         relative.push("..");
     }
     for part in &to[common..] {
@@ -1478,6 +1486,10 @@ mod tests {
             .join("Kerno")
             .join("kerno.exe");
         assert_eq!(askpass_spelling(&installed, &base), Ok(up.into_os_string()));
+        // Below the tunnels' folder: `.` first, never a name searched for.
+        let below = base.join("Kerno").join("kerno.exe");
+        let down = PathBuf::from(".").join("Kerno").join("kerno.exe");
+        assert_eq!(askpass_spelling(&below, &base), Ok(down.into_os_string()));
         let elsewhere = Path::new(root).join("tunnels");
         assert_eq!(askpass_spelling(&installed, &elsewhere), Err('É'));
         let greek = Path::new(root).join("Ωmega").join("kerno.exe");

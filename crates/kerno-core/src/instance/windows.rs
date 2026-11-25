@@ -297,21 +297,30 @@ pub fn serve(listener: Listener, mut on_line: impl FnMut(String) -> bool) {
         // second at most (`NONCE_TIMEOUT`).
         let peers = std::sync::Arc::new(tokio::sync::Semaphore::new(PEERS));
         let (sent, mut lines) = tokio::sync::mpsc::channel::<String>(PEERS);
+        // A place is taken before a peer is accepted, in a branch of its own:
+        // the lines are read while every place is held (T5).
+        let mut place = None;
         loop {
             tokio::select! {
+                // The semaphore is never closed.
+                taken = peers.clone().acquire_owned(), if place.is_none() => {
+                    let Ok(taken) = taken else {
+                        return;
+                    };
+                    place = Some(taken);
+                }
                 // An error here is a peer that wrote and closed before this
                 // call (`ERROR_NO_DATA`): what it wrote is still read below.
                 // Cancel safe: a peer is never lost between two turns.
-                _ = pipe.connect() => {
+                _ = pipe.connect(), if place.is_some() => {
                     // The next instance before this one is read: a second
                     // peer finds one free instead of a busy name.
                     let Ok(next) = next_instance(&name) else {
                         return;
                     };
                     let mut peer = std::mem::replace(&mut pipe, next);
-                    // The semaphore is never closed: the wait always ends.
-                    let Ok(permit) = peers.clone().acquire_owned().await else {
-                        return;
+                    let Some(permit) = place.take() else {
+                        continue;
                     };
                     let sent = sent.clone();
                     tokio::spawn(async move {
@@ -530,6 +539,36 @@ mod tests {
         server.join().unwrap();
         drop(silent);
         assert_eq!(received.try_iter().collect::<Vec<_>>(), ["postgres://h"]);
+    }
+
+    /// Three times more URLs at once than there are places: every one
+    /// arrives; the lines are read while every place is held (T5).
+    #[test]
+    fn many_urls_at_once_all_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = socket_path(dir.path()).unwrap();
+        let listener = listen(&path).unwrap().expect("nobody listens yet");
+        let count = 3 * PEERS;
+        let (sent, received) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut seen = 0;
+            serve(listener, |line| {
+                sent.send(line).unwrap();
+                seen += 1;
+                seen < count
+            })
+        });
+        let senders: Vec<_> = (0..count)
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || send(&path, &format!("postgres://h{n}")))
+            })
+            .collect();
+        for sender in senders {
+            sender.join().unwrap().unwrap();
+        }
+        server.join().unwrap();
+        assert_eq!(received.try_iter().count(), count);
     }
 
     /// Something else listens under the name the file holds (a program of

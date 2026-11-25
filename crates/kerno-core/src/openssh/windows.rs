@@ -111,19 +111,62 @@ pub fn stop_all() {
     if live.is_empty() {
         return;
     }
-    let listed = listing().and_then(|mut listing| listing.output().ok());
-    let pids = whole_tree(listed.as_ref().map(|output| &output.stdout[..]), &live);
-    let _ = taskkill(&pids).status();
+    let listed = listing().and_then(bounded);
+    let pids = whole_tree(listed.as_deref(), &live);
+    let _ = bounded(taskkill(&pids));
     live.clear();
+}
+
+/// How long the listing and each `taskkill` may take (T2): a hung WMI
+/// service then costs the quit 5 s, and the roots are stopped without it.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// Runs `command` for [`STOP_WAIT`] at most, stopping it past that; its
+/// standard output when it ended well. Blocking: [`stop_all`] and a stream
+/// dropped outside the runtime.
+fn bounded(mut command: std::process::Command) -> Option<Vec<u8>> {
+    let mut child = command.spawn().ok()?;
+    let reader = child.stdout.take().map(|mut output| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut output, &mut bytes);
+            bytes
+        })
+    });
+    let deadline = std::time::Instant::now() + STOP_WAIT;
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let bytes = reader.and_then(|reader| reader.join().ok());
+    ended.then(|| bytes.unwrap_or_default())
+}
+
+/// [`bounded`] on the runtime.
+async fn bounded_async(command: std::process::Command) -> Option<Vec<u8>> {
+    let mut command = Command::from(command);
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(STOP_WAIT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 /// The `ssh.exe` processes running now, as `<pid> <parent pid> <start>`
 /// lines (System32's PowerShell): the trees are read whole before anything
 /// is stopped, since `taskkill /T` walks them as it kills, and an `ssh.exe`
-/// started by a middle hop that died first is no longer under anything
-/// (seen on the runner with a chain of two jump hosts: the innermost
-/// `ssh.exe` stayed, holding its connection to the first jump host). `None`
-/// when System32's PowerShell is not where Windows puts it.
+/// started by a middle hop that died first is no longer under anything.
+/// `None` when System32's PowerShell is not where Windows puts it.
 fn listing() -> Option<std::process::Command> {
     use std::os::windows::process::CommandExt as _;
     let program = crate::tools::windows_program(r"WindowsPowerShell\v1.0\powershell.exe")?;
@@ -262,19 +305,19 @@ impl Drop for Tree {
             Ok(runtime) => {
                 runtime.spawn(async move {
                     let listed = match listing() {
-                        Some(listing) => Command::from(listing).output().await.ok(),
+                        Some(listing) => bounded_async(listing).await,
                         None => None,
                     };
-                    let pids = whole_tree(listed.as_ref().map(|out| &out.stdout[..]), &[pid]);
-                    let _ = Command::from(taskkill(&pids)).status().await;
+                    let pids = whole_tree(listed.as_deref(), &[pid]);
+                    let _ = bounded_async(taskkill(&pids)).await;
                     release(child, pid);
                     drop(io);
                 });
             }
             Err(_) => {
-                let listed = listing().and_then(|mut listing| listing.output().ok());
-                let pids = whole_tree(listed.as_ref().map(|out| &out.stdout[..]), &[pid]);
-                let _ = taskkill(&pids).status();
+                let listed = listing().and_then(bounded);
+                let pids = whole_tree(listed.as_deref(), &[pid]);
+                let _ = bounded(taskkill(&pids));
                 release(child, pid);
                 drop(io);
             }

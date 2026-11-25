@@ -650,6 +650,56 @@ pub mod k69 {
             .collect()
     }
 
+    /// One running process: its id, its parent's, its executable and its
+    /// command line.
+    #[derive(Debug, Clone)]
+    pub struct Process {
+        pub pid: u32,
+        pub parent: u32,
+        pub executable: PathBuf,
+        pub command: String,
+    }
+
+    /// Every running process, whatever its name.
+    pub fn processes() -> Vec<Process> {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | ForEach-Object { \
+                 \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.ExecutablePath)`t$($_.CommandLine)\" }",
+            ])
+            .output()
+            .expect("list the processes");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.trim_end().splitn(4, '\t');
+                Some(Process {
+                    pid: fields.next()?.trim().parse().ok()?,
+                    parent: fields.next()?.parse().ok()?,
+                    executable: PathBuf::from(fields.next()?),
+                    command: fields.next().unwrap_or_default().to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// `root` and every process under it in `all`, by the parent chain.
+    pub fn descendants(all: &[Process], root: u32) -> Vec<Process> {
+        let mut found: Vec<Process> = all.iter().filter(|p| p.pid == root).cloned().collect();
+        let mut at = 0;
+        while let Some(parent) = found.get(at).map(|p| p.pid) {
+            for process in all {
+                if process.parent == parent && !found.iter().any(|seen| seen.pid == process.pid) {
+                    found.push(process.clone());
+                }
+            }
+            at += 1;
+        }
+        found
+    }
+
     /// Waits up to 15 s until no `ssh.exe` whose command line holds
     /// `marker` runs; panics naming the ones left. Async: the tasks that
     /// stop a stream's `ssh.exe` run on the test's runtime meanwhile.

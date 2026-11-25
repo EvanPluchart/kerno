@@ -392,34 +392,163 @@ async fn a_chain_of_jump_hosts_runs_the_chosen_ssh_exe_from_a_folder_with_a_spac
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let openssh = dir.path().join("Program Files test").join("OpenSSH");
-    std::fs::create_dir_all(&openssh).unwrap();
-    let system = k69::system32("ssh.exe");
-    for entry in std::fs::read_dir(system.parent().unwrap()).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
-            std::fs::copy(entry.path(), openssh.join(entry.file_name())).unwrap();
-        }
-    }
+    let ssh = copy_openssh(&dir.path().join("Program Files test").join("OpenSSH"));
     let mut fixture = k69::openssh(dir.path(), askpass(), true);
-    fixture.env.ssh = openssh.join("ssh.exe");
+    fixture.env.ssh = ssh;
     let jump = format!("{},{}", k69::JUMP, k69::HOP2);
     let config = k69::config(k69::ssh(key("kerno_k69"), Some(jump.clone())));
     let tunnel = open(&fixture.env, &config, None, None)
         .await
         .expect("a tunnel through two jump hosts");
-    probe(&tunnel, &config).await;
-    let held = tunnel.open_stream(&config.host, config.port).await.unwrap();
+    // One stream only: the one the start opened.
+    let mut held = tunnel.open_stream(&config.host, config.port).await.unwrap();
+    speaks(&mut held).await;
     let marker = marker(&tunnel);
+    // By the parent chain from this test, whatever a process's name or
+    // command line (T4): exactly one stream's `ssh.exe` and its two hops',
+    // each that copy, and no `ssh.exe` of the tunnel outside that tree.
+    let all = k69::processes();
+    let roots: Vec<u32> = all
+        .iter()
+        .filter(|p| p.parent == std::process::id() && p.command.contains(&marker))
+        .map(|p| p.pid)
+        .collect();
+    assert_eq!(roots.len(), 1, "one stream: {all:#?}");
+    let everything = k69::descendants(&all, roots[0]);
+    eprintln!("the stream's tree: {everything:#?}");
+    // Windows gives the console program a console host (seen: one, under
+    // the stream's own `ssh.exe`); anything else in the tree is that copy.
+    let console_host = canonical(&k69::system32("ssh.exe"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("conhost.exe");
+    let tree: Vec<_> = everything
+        .iter()
+        .filter(|p| canonical(&p.executable) != console_host)
+        .collect();
+    assert_eq!(
+        tree.len(),
+        3,
+        "the stream's ssh.exe and its two hops': {everything:#?}"
+    );
+    for process in &tree {
+        assert_eq!(
+            canonical(&process.executable),
+            canonical(&fixture.env.ssh),
+            "{process:?}"
+        );
+    }
+    let outside: Vec<_> = all
+        .iter()
+        .filter(|p| p.command.contains(&marker) && !tree.iter().any(|t| t.pid == p.pid))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "outside the stream's tree: {outside:#?}"
+    );
     let running = runs_only(&marker, &fixture.env.ssh);
-    assert!(running >= 3, "the stream's and its two hops': {running}");
+    assert_eq!(running, 3);
     drop(held);
     drop(tunnel);
     wait_until_gone(&marker).await;
     eprintln!(
-        "K69 PROVED: through {jump}, {running} ssh.exe, each {}",
+        "K69 PROVED: through {jump}, exactly {} ssh.exe by the parent chain, each {}",
+        tree.len(),
         fixture.env.ssh.display()
     );
+}
+
+/// System32's OpenSSH folder copied to `to`; its `ssh.exe` there.
+fn copy_openssh(to: &Path) -> PathBuf {
+    std::fs::create_dir_all(to).unwrap();
+    let system = k69::system32("ssh.exe");
+    for entry in std::fs::read_dir(system.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+    to.join("ssh.exe")
+}
+
+/// PostgreSQL answers the SSLRequest on `stream`.
+async fn speaks(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin)) {
+    let read = async {
+        stream.write_all(&SSL_REQUEST).await.unwrap();
+        let mut answer = [0u8; 1];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer[0], b'N', "PostgreSQL answers the SSLRequest");
+    };
+    tokio::time::timeout(Duration::from_secs(15), read)
+        .await
+        .expect("no answer through the tunnel");
+}
+
+/// The helper named by a relative spelling (an accented profile) is the
+/// one under the folder `ssh.exe` runs in, never a file at the same
+/// spelling under `ssh.exe`'s own folder, for both shapes Kerno makes:
+/// `..\…` (an install beside the tunnels' folder) and `.\…` (below it). For
+/// each, a decoy (a working helper) is planted at `<ssh.exe's folder>\
+/// <spelling>` with the real one absent: the login must fail at "could not
+/// start the helper"; then the real one is put in place and the login works
+/// (T1).
+#[tokio::test]
+async fn a_relative_helper_is_never_taken_from_ssh_exe_s_folder() {
+    if !k69::runner() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // Three folders deep, so that `..\..\..` from `ssh.exe`'s folder stays
+    // inside this test's folder.
+    let ssh = copy_openssh(&dir.path().join("a").join("b").join("c").join("OpenSSH"));
+    let openssh = ssh.parent().unwrap().to_path_buf();
+    let profile = dir.path().join("Élodie");
+    let base = profile.join("AppData").join("Local").join("ssh");
+    let name = askpass().file_name().unwrap().to_owned();
+    for (shape, helper) in [
+        ("..", profile.join("Programs").join("Kerno").join(&name)),
+        (".", base.join("Programs").join("Kerno").join(&name)),
+    ] {
+        let mut fixture = k69::openssh(dir.path(), askpass(), true);
+        fixture.env.ssh = ssh.clone();
+        fixture.env.tunnels = Some(base.clone());
+        fixture.env.askpass = helper.clone();
+        std::fs::create_dir_all(&base).unwrap();
+        let spelling = match shape {
+            ".." => PathBuf::from(r"..\..\..\Programs\Kerno").join(&name),
+            _ => PathBuf::from(r".\Programs\Kerno").join(&name),
+        };
+        let decoy = openssh.join(&spelling);
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::copy(askpass(), &decoy).unwrap();
+        let _ = std::fs::remove_file(&helper);
+        let config = k69::config(k69::ssh(key("kerno_k69_enc"), None));
+        let error = open(&fixture.env, &config, Some(PASSPHRASE), None)
+            .await
+            .expect_err("the decoy at ssh.exe's folder must not answer");
+        let text = Error::from(error).to_string();
+        assert!(text.contains("ssh_askpass: posix_spawnp"), "{text}");
+        eprintln!(
+            "K69 PROVED: {} not run for {} (helper absent): {}",
+            decoy.display(),
+            spelling.display(),
+            text.lines().next().unwrap_or_default()
+        );
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        std::fs::copy(askpass(), &helper).unwrap();
+        let tunnel = open(&fixture.env, &config, Some(PASSPHRASE), None)
+            .await
+            .expect("the helper where the tunnels' folder names it");
+        probe(&tunnel, &config).await;
+        drop(tunnel);
+        eprintln!(
+            "K69 PROVED: {} answered for {}",
+            helper.display(),
+            spelling.display()
+        );
+        std::fs::remove_file(&decoy).unwrap();
+    }
 }
 
 /// A chain of three jump hosts: four `ssh.exe` per stream, each started by
