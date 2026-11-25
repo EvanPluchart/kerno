@@ -2275,6 +2275,30 @@ pub fn find_naming(
     for (start, end) in split.statements {
         let tokens = names(tokens(&text[start..end], &part[start..end]), mode.ansi());
         mode.follow(&tokens);
+        // A statement that selects a database wherever it stands on its line
+        // (`SELECT 1; use src`, `/* c */ use src`, `/*!40000 USE src */`):
+        // as the `use` line (N1). Even one that selects the target: what it
+        // selects later in the file is not followed.
+        if tokens
+            .first()
+            .is_some_and(|token| token.is("USE") || token.is("CONNECT"))
+        {
+            let line = line_starts.partition_point(|(at, _)| *at <= start);
+            let said: String = String::from_utf8_lossy(&text[start..end])
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(60)
+                .collect();
+            whole.get_or_insert_with(|| {
+                format!(
+                    "its line {line} selects a database itself (“{said}”), so what follows acts \
+                     there"
+                )
+            });
+            continue;
+        }
         let head = head(&tokens);
         let at_head = |index: usize| {
             head.as_ref()
@@ -5669,6 +5693,25 @@ mod tests {
             ),
             ("CONNECT src\nSELECT 1;\n".into(), (vec![], true)),
             ("\\u src\nSELECT 1;\n".into(), (vec![], true)),
+            // N1: a statement that selects a database wherever it stands on
+            // its line; in a string it is no statement.
+            (
+                "SELECT 1; use src\nCREATE PROCEDURE p() SELECT 1;\n".into(),
+                (vec![], true),
+            ),
+            (
+                "/* c */ use src;\nCREATE PROCEDURE p() SELECT 1;\n".into(),
+                (vec![], true),
+            ),
+            (
+                "/*!40000 USE src */;\nCREATE PROCEDURE p() SELECT 1;\n".into(),
+                (vec![], true),
+            ),
+            ("SELECT 1; connect src\nSELECT 2;\n".into(), (vec![], true)),
+            (
+                "SELECT 'use src', \"use src\";\nSELECT ';use src';\n".into(),
+                (vec![], false),
+            ),
             // M3: a bare definer or name that is a kind word hides nothing.
             (
                 "CREATE DEFINER=event@localhost TRIGGER src.x BEFORE INSERT ON src.t FOR EACH ROW \

@@ -4599,6 +4599,15 @@ views were then not loaded, and "Run the restore again" failed the same way each
   of the file had reached it; after that the tool was stopped part way and what ran is kept (P3). The driver
   test now also checks the target's view and events.
 
+**Amended after the review's second run** (of a0f69df): a `USE` was caught only as the first word of a line;
+`SELECT 1; use src`, `/* c */ use src;` and `/*!40000 USE src */;` switch the session too (checked by the
+reviewer with the mysql client on MariaDB 11). Now any statement whose first word is `USE` or `CONNECT`,
+wherever it stands on its line, leaves its file out whole as the `use` line does (N1). The client-command
+check refuses `connect` only as a line's first word, so a `connect` after another statement on its line is
+caught here. A `USE` of the target itself is not let through (N2, not taken): the file is left out all the
+same, as what such a file selects later is not followed; mysqldump writes none in a folder, so only an edited
+file meets it.
+
 ## D-144 — A connection opened again is a new tree; a lost tree read is read once more (K75; 2026-11-25)
 
 The real-app pass of 2026-11-25 found the schema tree failing every read with "connection closed: the session

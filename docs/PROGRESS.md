@@ -2051,3 +2051,5 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   enabled event whose body names the source is left out by default. D-145 amended, M12's K78 table.
 - K79's agent's three points in the same files: a rows client that stopped reading said in plain words, the
   definitions' run naming the table it stopped in, "Nothing was run." only when nothing reached the tool.
+- The review's second run: a `USE` after another statement on its line, or behind a comment, also switched
+  the session; any statement that starts with `USE` or `CONNECT` now leaves its file out whole (D-145).
