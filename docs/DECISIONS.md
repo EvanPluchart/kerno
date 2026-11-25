@@ -4457,6 +4457,41 @@ one that finds the user's files, its updates and the backup tools.
   runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
   OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
 
+## D-146 — A client that ends well before the end of its input fails the run (K79; 2026-11-25)
+
+K74's test `a_feed_that_fails_never_ends_the_child_s_input` failed on three CI runs (twice on Linux, once on
+the macOS runner), never on the owner's Mac. Its second loop feeds a stand-in that reads the first part's 10
+bytes and ends 0, then a part that cannot be read. On GitHub's Linux runner (K79's probe, run 45546772717, the
+code of `main` with a print added) it failed 8 times in 200 alone, 28 in 200 beside the whole `tools::tests`
+module, 175 in 200 beside four busy loops, every time the same way: the child had ended, its output pipes were
+closed, the feed was still on its way to the next part (opening and reading are hops to Tokio's blocking pool),
+and `tools::run` aborted it and returned the child's exit 0. The test was right; `run` was wrong.
+
+- **The rule.** Once the child has ended, `run` waits for its feed, at most 2 s (`FEED_AFTER_EXIT`): with the
+  child gone the feed ends at once (its next write fails) or reaches the part it cannot read, whose error then
+  wins as K74's N1 wanted. Then, a child that ended **well** while some part of its input was not written whole
+  (the feed counts the parts it finished) fails the run in plain words, `Error::Config`: "psql stopped reading
+  before the end of /path/restore.sql and ended without an error: the rest of the script was not run." The file
+  named is the part it stopped in (a text of Kerno's own, the folder restore's markers, by the file before it).
+  A child that ended with a failure keeps its status: a client that stops on an ERROR (ON_ERROR_STOP) says so
+  already. `Config` because the restore dialog shows it as it is; another kind would read "Nothing was run".
+- **What a user could have seen.** A restore or "Execute script" said Done while the end of its file never ran,
+  whenever the client stopped reading on its own and ended 0: psql's `\q` (the scan lets it through; run here:
+  psql 14.25 on `kerno-postgres`, a script of `\q` followed by 2.4 MB, `Ok(exit 0)` before, the failure after);
+  MariaDB's `quit` under `--sandbox` and any `quit` on a scan-only MySQL client, by the module's table (no such
+  client here: not run). MySQL's 26.10 client under `--commands=OFF` takes `quit` for SQL: ERROR 1064, exit 1
+  (run), not concerned.
+- **The ceiling.** What the child left unread in the pipe, or read into its own buffer, is not seen: a stop
+  with less than about a pipe's worth after it (64 KiB on Linux, plus the client's buffer) still ends Done
+  (psql 14.25 with one statement after `\q`: `Ok(exit 0)` before and after). The whole fix is a mark the client
+  must print back at the end of its input (psql `\echo`, a mysql `SELECT`, as the folder restore's
+  `kerno-defined:N`), which touches the restore commands, not `run`, and has cases to decide (a mark inside COPY
+  data, a `DELIMITER` left on, a quote left open, the mark in the log); or the scan could refuse `\q` and
+  `quit`. Left to the owner.
+- **Not chosen.** Aborting the unfinished feed and taking it as "not fed whole" without waiting: a feed that has
+  written everything but has not returned yet would fail a good restore on a loaded machine. Waiting without a
+  bound: a grandchild of the client holding its input open would hold the run.
+
 ## D-144 — A connection opened again is a new tree; a lost tree read is read once more (K75; 2026-11-25)
 
 The real-app pass of 2026-11-25 found the schema tree failing every read with "connection closed: the session

@@ -724,7 +724,10 @@ no column of a MySQL 5.1 table (the backup would hold no table), and `mariadb-du
 and says which tool restores it), the database it goes into, what a restore does to it, the client.
 **Restore…** shows the command and asks first, twice on a production connection; a read-only connection has
 no restore. Enter never starts a restore. A SQL file that holds client commands (`\!`, `\connect`, `system`…)
-is refused; it can be allowed in the advanced settings, for a file you trust.
+is refused; it can be allowed in the advanced settings, for a file you trust. A client that stops reading the
+file on its own before its end (psql's `\q`, MariaDB's `quit`) and ends without an error fails the restore or
+the script in plain words ("psql stopped reading before the end of … the rest of the script was not run"),
+when more than a few dozen kilobytes were left; a stop closer to the end is not seen.
 
 A backup made on another server gives its objects to that server's roles. Restored into a server without them
 (a production backup into your own PostgreSQL), pg_restore stops at the first one; Kerno then says which role

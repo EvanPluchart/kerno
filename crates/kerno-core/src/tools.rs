@@ -85,7 +85,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -2720,8 +2720,14 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 /// Runs `command`, passing every line it writes (standard output and
 /// error, as they come) to `on_line`. Returns the exit status, which may
 /// be a failure; `Err` means the tool could not be started, its script was
-/// refused by [`check_script`] (nothing ran), or [`Error::Cancelled`] when
-/// `cancel` was set (the child is killed).
+/// refused by [`check_script`] (nothing ran), a part of its input could
+/// not be read, it ended well before reading the whole of its input (part
+/// of the script never ran), or [`Error::Cancelled`] when `cancel` was set
+/// (the child is killed).
+///
+/// What the child had in its input pipe when it ended is not seen: a tool
+/// that ends well with the last bytes written to the pipe still unread
+/// is taken at its word.
 pub async fn run(
     command: ToolCommand,
     on_line: impl Fn(String) + Send + 'static,
@@ -2788,10 +2794,20 @@ pub async fn run(
         )
     })?;
     // Fed beside the reading of the output, and stopped with the child.
+    // `fed` counts the parts written whole: a child that ends well before
+    // the last one stopped reading on its own (K79).
+    let parts: Vec<Option<PathBuf>> = input
+        .iter()
+        .map(|part| match part {
+            StdinPart::File { path, .. } => Some(path.clone()),
+            StdinPart::Text(_) => None,
+        })
+        .collect();
+    let fed = Arc::new(AtomicUsize::new(0));
     let feeding = (!input.is_empty())
         .then_some(input)
         .zip(child.stdin.take())
-        .map(|(input, pipe)| tokio::spawn(feed(input, pipe, command.sent.clone())));
+        .map(|(input, pipe)| tokio::spawn(feed(input, pipe, command.sent.clone(), fed.clone())));
     let mut feeding = Feeding(feeding);
 
     let mut stdout = child.stdout.take().map(BufReader::new);
@@ -2828,17 +2844,28 @@ pub async fn run(
             // Both pipes are read to their end first, so a chatty child
             // never blocks on a full pipe.
             status = child.wait(), if stdout.is_none() && stderr.is_none() => {
-                // A feed that failed as the child ended: its error wins.
-                if let Some(task) = feeding.0.take() {
-                    if task.is_finished() {
-                        if let Ok(Err((error, _))) = task.await {
-                            return Err(error);
-                        }
-                    } else {
-                        task.abort();
+                // The child is gone, so its feed ends at once (its next write
+                // fails), or finds the part it cannot read: waited for, since
+                // aborting it there took a feed still on its way for a child
+                // that had all it needed (K79). A grandchild holding the
+                // input open is not waited for longer than this.
+                if let Some(mut task) = feeding.0.take() {
+                    let ended = tokio::time::timeout(FEED_AFTER_EXIT, &mut task).await;
+                    task.abort();
+                    // A feed that failed as the child ended: its error wins.
+                    if let Ok(Ok(Err((error, _)))) = ended {
+                        return Err(error);
                     }
                 }
-                return status.map_err(|error| Error::io("waiting for the tool", error));
+                let status = status.map_err(|error| Error::io("waiting for the tool", error))?;
+                // Ended well without the end of its input: it stopped reading
+                // on its own (`quit`, `\q`), and the rest never ran. One that
+                // stopped on an error says so by its status (K79).
+                let fed = fed.load(Ordering::Acquire);
+                if status.success() && fed < parts.len() {
+                    return Err(Error::Config(stopped_reading(&command.program, &parts, fed)));
+                }
+                return Ok(status);
             }
             _ = tick.tick() => {
                 if cancel.load(Ordering::Relaxed) {
@@ -2851,12 +2878,40 @@ pub async fn run(
     }
 }
 
+/// How long [`run`] waits for the feed once the child ended (see there).
+const FEED_AFTER_EXIT: Duration = Duration::from_secs(2);
+
+/// What [`run`] says of a client that ended well before the end of its
+/// input: it stopped at part `at`, named by its file (a text of Kerno's own
+/// by the file it follows).
+fn stopped_reading(program: &Path, parts: &[Option<PathBuf>], at: usize) -> String {
+    let tool = program.file_stem().unwrap_or(program.as_os_str());
+    let tool = tool.to_string_lossy();
+    let file = parts[..=at]
+        .iter()
+        .rev()
+        .chain(&parts[at + 1..])
+        .flatten()
+        .next();
+    match file {
+        Some(file) => format!(
+            "{tool} stopped reading before the end of {} and ended without an error: the rest \
+             of the script was not run.",
+            file.display()
+        ),
+        None => format!(
+            "{tool} stopped reading before the end of its input and ended without an error: \
+             the rest of the script was not run."
+        ),
+    }
+}
+
 /// Copies `input` to the child's standard input, each file opened when its
 /// turn comes and closed after, counting the bytes of the counted parts in
-/// `sent`, then closes it (the end of the script). Stops quietly when the
-/// child closes its end first: it stopped on an error, or was killed. A
-/// file that cannot be opened or read is an error: [`run`] then kills the
-/// child.
+/// `sent` and the parts written whole in `fed`, then closes it (the end of
+/// the script). Stops quietly when the child closes its end first: it
+/// stopped on an error or on its own, or was killed. A file that cannot be
+/// opened or read is an error: [`run`] then kills the child.
 ///
 /// On such an error the pipe comes back with it, still open: the child
 /// must never see the end of its input (it would run a last statement cut
@@ -2865,8 +2920,9 @@ async fn feed(
     input: Vec<StdinPart>,
     mut pipe: tokio::process::ChildStdin,
     sent: Arc<AtomicU64>,
+    fed: Arc<AtomicUsize>,
 ) -> std::result::Result<(), (Error, tokio::process::ChildStdin)> {
-    match feed_parts(input, &mut pipe, sent).await {
+    match feed_parts(input, &mut pipe, sent, fed).await {
         Ok(()) => Ok(()),
         Err(error) => Err((error, pipe)),
     }
@@ -2877,6 +2933,7 @@ async fn feed_parts(
     input: Vec<StdinPart>,
     pipe: &mut tokio::process::ChildStdin,
     sent: Arc<AtomicU64>,
+    fed: Arc<AtomicUsize>,
 ) -> Result<()> {
     use tokio::io::AsyncSeekExt as _;
     let mut chunk = vec![0; 256 * 1024];
@@ -2886,6 +2943,7 @@ async fn feed_parts(
                 if pipe.write_all(text.as_bytes()).await.is_err() {
                     return Ok(());
                 }
+                fed.fetch_add(1, Ordering::Release);
                 continue;
             }
             StdinPart::File {
@@ -2914,6 +2972,7 @@ async fn feed_parts(
                 sent.fetch_add(read as u64, Ordering::Relaxed);
             }
         }
+        fed.fetch_add(1, Ordering::Release);
     }
     Ok(())
 }
@@ -6140,8 +6199,107 @@ mod tests {
                 });
             }
             let ended = run(command, |_| {}, Arc::new(AtomicBool::new(false))).await;
-            assert!(ended.is_err(), "run {run_at}: the child's status won");
+            let error = ended.expect_err(&format!("run {run_at}: the child's status won"));
+            // The feed's own error, not the words of a client that stopped
+            // reading: the feed is waited for once the child ended (K79).
+            assert!(
+                error.to_string().contains("could not read")
+                    && error.to_string().contains("broken.sql"),
+                "run {run_at}: {error}"
+            );
         }
+    }
+
+    /// K79: a client that stops reading its script on its own (`quit`,
+    /// `\q`) and ends well fails the run in plain words, naming the file it
+    /// stopped in (a text of Kerno's own by the file before it); one that
+    /// stopped on an error keeps its status
+    /// (`a_client_that_stops_reading_its_script_ends_the_run`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_client_that_ends_well_before_the_end_of_its_input_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ten = dir.path().join("ten.sql");
+        std::fs::write(&ten, "SELECT 1;\n").unwrap();
+        // More than a pipe holds: its writes fail once the child is gone.
+        let rest = dir.path().join("rest.sql");
+        std::fs::write(&rest, vec![b'x'; 1024 * 1024]).unwrap();
+        let file = |path: &Path| StdinPart::File {
+            path: path.to_path_buf(),
+            range: 0..u64::MAX,
+            counted: true,
+        };
+        let mut command = shell("head -c 10 > /dev/null; exit 0");
+        command.stdin_parts = vec![file(&ten), file(&rest)];
+        let error = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        let Error::Config(text) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(
+            *text,
+            format!(
+                "sh stopped reading before the end of {} and ended without an error: the rest \
+                 of the script was not run.",
+                rest.display()
+            )
+        );
+        // Stopped at a text of Kerno's own: named by the file it follows.
+        let mut command = shell("head -c 10 > /dev/null; exit 0");
+        command.stdin_parts = vec![file(&ten), StdinPart::Text("x".repeat(1024 * 1024))];
+        let error = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("end of ") && error.to_string().contains("ten.sql"));
+        // Everything fed: the child's status, whatever it read.
+        let mut command = shell("head -c 10 > /dev/null; exit 0");
+        command.stdin_parts = vec![file(&ten)];
+        let status = run(command, |_| {}, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// K79, what the Linux runner saw once: the child ended well while its
+    /// feed was still on its way to the next part (here held for good, at
+    /// the opening of a named pipe nobody writes): the run fails, it never
+    /// takes the child's status for a whole script.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_ends_well_before_its_feed_does_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ten = dir.path().join("ten.sql");
+        std::fs::write(&ten, "SELECT 1;\n").unwrap();
+        let held = dir.path().join("held.sql");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&held)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mut command = shell("head -c 10 > /dev/null; exit 0");
+        for path in [ten, held.clone()] {
+            command.stdin_parts.push(StdinPart::File {
+                path,
+                range: 0..u64::MAX,
+                counted: true,
+            });
+        }
+        let started = Instant::now();
+        let ended = run(command, |_| {}, Arc::new(AtomicBool::new(false))).await;
+        // The feed's opening returns once the pipe has a writer: the
+        // runtime then ends.
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&held)
+                .unwrap(),
+        );
+        let error = ended.expect_err("the child's status won");
+        assert!(error.to_string().contains("held.sql"), "{error}");
+        // Waited for no longer than said.
+        assert!(started.elapsed() < FEED_AFTER_EXIT + Duration::from_secs(3));
     }
 
     /// A client that stops reading (psql's ON_ERROR_STOP) ends the run at

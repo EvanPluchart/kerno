@@ -2009,3 +2009,19 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   tests): the rule "no file of another computer" refused `\\?\C:\…`, a canonical path of this computer:
   accepted now in that exact spelling (D-138 amended). A form test wrote a Unix path where Windows needs a
   drive: it writes a full path of each system. A Windows-only test of `tools.rs` lacked K74's new field.
+
+## 2026-11-25 — K79: K74's feed test that failed on GitHub's runners
+
+- `a_feed_that_fails_never_ends_the_child_s_input` failed on three CI runs (Linux twice, the macOS runner once),
+  never here. A probe on the Linux runner (`.github/workflows/linux-tests-probe.yml` on the branch
+  `linux-tests`, not merged) reproduced it on `main`'s code: 8 in 200 alone, 28 in 200 beside its module, 175 in
+  200 under load (run 45546772717), each time `tools::run` aborting a feed still on its way to the next part
+  once the child had ended 0, and returning that status. The app's fault, not the test's.
+- The fix, in `run` (D-146): once the client ended, its feed is waited for (2 s at most) and its read error
+  wins; a client that ended well while part of its input was never written fails the run in plain words ("psql
+  stopped reading before the end of … the rest of the script was not run."). Before it, psql's `\q` followed by
+  2.4 MB on `kerno-postgres` ended "Done". A stop with less than a pipe's worth after it is still not seen: the
+  complete fix (a mark the client prints back) is left to the owner.
+- Proved on the runner, run 45550563294: 0 failures in 200 runs of the test alone, 200 beside its module, 200
+  under load, 200 on the macOS runner; the fix's wait taken out, red again in each shape (run 45548327971).
+  Here: 200 in 200, `kerno-core` (768), `kerno-mysql --test folder_backup` (18), `ui_tests::mysql_folder` (11).
