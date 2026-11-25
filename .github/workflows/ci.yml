@@ -139,7 +139,13 @@ jobs:
           cargo test -p kerno-core --test windows -- --nocapture --test-threads=1
           cargo test -p kerno-postgres --test tools -- windows_k67 --nocapture
           cargo test -p kerno-mysql --test tools -- windows_k67 --nocapture
-          cargo test -p kerno --bin kerno -- windows_k67 --nocapture
+          # The update check asks GitHub itself with System32's curl: a runner's network can time
+          # out (curl's exit 28, seen once), so it is tried three times before it counts as failed.
+          for try in 1 2 3; do
+            if cargo test -p kerno --bin kerno -- windows_k67 --nocapture; then break; fi
+            if [ "$try" = 3 ]; then exit 1; fi
+            sleep 20
+          done
         env:
           KERNO_K67_RUNNER: "1"
       - name: Stop the test servers
