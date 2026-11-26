@@ -305,7 +305,7 @@ test sont décrites dans le [guide](docs/GUIDE.md#build-from-source).
 
 ## État du projet
 
-Version 2026.11.4. Elle couvre PostgreSQL, MySQL, MariaDB et SQLite sous macOS (Apple
+Version 2026.11.5. Elle couvre PostgreSQL, MySQL, MariaDB et SQLite sous macOS (Apple
 Silicon), Linux (x86_64 et arm64) et, en aperçu, Windows (x86_64). D'autres moteurs, la comparaison de
 données et d'autres fonctions sont sur la [feuille de route](docs/ROADMAP.md).
 

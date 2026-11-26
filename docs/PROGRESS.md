@@ -2113,3 +2113,14 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   is the computer's: its name from `iana-time-zone`, its rules from chrono's `Local` (both already in the lock,
   now direct dependencies of `kerno-core`). M12's K82, D-148; tests in `local_time.rs` and `ui_tests/k82.rs`,
   each seen failing without its part; headless captures light and dark looked at.
+
+## 2026-11-26 — 2026.11.5 prepared
+
+- The owner's two asks of the day: the value viewers in the theme's colours (K81, D-147) and a time with a
+  zone read in the computer's own (K82, D-148); with them K80's second part, a Refresh that keeps the schema
+  tree where it was. The CI was green on its six jobs for the three (14e30b4), Windows and Linux included.
+- No pass in the real app this time: the owner works at this Mac and a GUI driver takes the pointer (he
+  stopped the one I had started). The proof is the UI tests, the headless captures and the CI; he tries the
+  draft himself before publishing.
+- Version 2026.11.5 and its notes (`docs/release-notes/v2026.11.5.md`); the tag `v2026.11.5` makes
+  `release.yml` build the ten files and open a draft.

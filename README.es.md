@@ -299,7 +299,7 @@ empaquetado, las comprobaciones locales y las bases de datos de prueba se descri
 
 ## Estado
 
-Versión 2026.11.4. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon), Linux
+Versión 2026.11.5. Cubre PostgreSQL, MySQL, MariaDB y SQLite en macOS (Apple Silicon), Linux
 (x86_64 y arm64) y, como vista previa, Windows (x86_64). Otros motores, la comparación de datos y más están
 en la [hoja de ruta](docs/ROADMAP.md).
 

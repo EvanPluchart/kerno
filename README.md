@@ -283,7 +283,7 @@ the local checks and the test databases are described in the [guide](docs/GUIDE.
 
 ## Status
 
-Version 2026.11.4. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon), Linux
+Version 2026.11.5. It covers PostgreSQL, MySQL, MariaDB and SQLite on macOS (Apple Silicon), Linux
 (x86_64 and arm64) and, as a preview, Windows (x86_64); MySQL from 5.1 on, with what each old release lacks
 said in the [guide](docs/GUIDE.md#supported-servers). Other engines, data compare and more are on the
 [roadmap](docs/ROADMAP.md).
