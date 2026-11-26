@@ -17,10 +17,14 @@ fn in_paris(app: &Fixture, cx: &mut TestAppContext) -> bool {
     local_times(app, cx)
 }
 
-/// Whether the switch is on, in the settings and in storage.
+/// Whether the switch is on, in the settings and, once their writer has
+/// written (it writes off the UI thread, a moment after the change), in
+/// storage.
 fn local_times(app: &Fixture, cx: &mut TestAppContext) -> bool {
     let on = cx.update(|cx| AppState::get(cx).settings.local_times);
-    assert_eq!(Settings::load(&app.storage).local_times, on, "stored");
+    app.wait_until(cx, "the setting stored", |app, _| {
+        Settings::load(&app.storage).local_times == on
+    });
     on
 }
 

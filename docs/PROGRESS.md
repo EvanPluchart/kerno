@@ -2124,3 +2124,9 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   draft himself before publishing.
 - Version 2026.11.5 and its notes (`docs/release-notes/v2026.11.5.md`); the tag `v2026.11.5` makes
   `release.yml` build the ten files and open a draft.
+- 2026.11.5 was published at the owner's word (a tag, a draft with ten files, their checksums and the
+  `.dmg`'s app verified). The CI of the version's commit was red on the Linux job for one test of K82
+  (`a_value_without_a_zone_offers_nothing`: it read the stored setting at once, while the settings are
+  written a moment after the change, off the UI thread); the same code had been green on its six jobs one
+  commit before. The test now waits for the write. I published without having read that result: the
+  release's own check must stop on it.
