@@ -4457,6 +4457,47 @@ one that finds the user's files, its updates and the backup tools.
   runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
   OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
 
+## D-147 — The value viewers are the kit's editor, in the SQL editor's colours (K81; 2026-11-26)
+
+The owner asked for the data viewers to be coloured with the theme. The value panel (K17) already laid a value
+out in the kit's `Editor` with its JSON highlighter; the viewer dialog drew a plain `div` on the muted surface
+and the value editor a `Textarea`, which the kit does not highlight.
+
+- **One way to draw a value.** The dialog and the value editor use the panel's editor (`viewer::value_editor`):
+  the kit's tree-sitter JSON grammar, coloured by the theme's syntax tokens, the same ones the SQL editor reads,
+  so a change of theme follows everywhere. No second highlighter. The dialog's editor is read only; its text can
+  now be selected and copied in part (the `div` could not); Copy still copies the whole value (or the whole hex
+  dump), not what the editor holds.
+- **What each JSON part takes.** Strings `string`, numbers `number`, `true`/`false` `boolean`, keys `property`
+  (the editor's text colour in both themes), punctuation the editor's text colour, `null` `constant`. The theme's
+  `constant` was purple and is now `muted.foreground`, italic: the grid's NULL styling. No capture of the SQL
+  grammar (tree-sitter-sequel) is `constant` or `property`, so the SQL editor does not change. A `punctuation`
+  token was not added: the SQL editor's brackets and commas would change with it.
+- **The surface.** The dialog's text drew on `muted.background`, where no test measured the syntax colours (the
+  comment colour, 4.28:1 there in light). Every viewer now draws on `background`, the editor's own surface,
+  where every syntax colour is tested. Ratios on it: keys 17.63 and 14.77:1 (light, dark), strings 6.26 and
+  10.23, numbers and booleans 6.14 and 7.75, `null` 7.10 and 7.91, the hex view's dim level 4.89 and 5.00
+  (`theme::tests::the_value_viewers_read_on_their_surface`).
+- **The hex view.** Offsets and the ASCII gutter in `muted.foreground`, the bytes in the text colour, the
+  gutter's unprintable bytes in `editor.line_number` (a level dimmer, still 4.5:1). The parts come from the bytes
+  (`format::hex_parts`), since the dump writes a real `.` byte as it writes an unprintable one, and are painted as
+  one decoration collection, again if the theme changes while the dialog is open.
+- **Not highlighted.** XML and HTML: the kit has a grammar behind its `tree-sitter-html` feature, but the crate
+  is not in `Cargo.lock` (no new dependency). SQL kept in a text column: guessing it from a name is too unsure.
+  PostgreSQL arrays and composites: no grammar. The grid's cells: one line each, styled by type, as before.
+- **Ligatures off** in every viewer: a value is shown as stored (`<=>` was drawn as one arrow in the hex
+  gutter). The SQL editor keeps its setting.
+- **Wrapping has a bound.** The kit's editor lays out every line of a wrapped text before its first paint:
+  opening a 5 MB JSON document took 171–178 ms with the 256 kB shown wrapped, against 95–98 ms before K81 (debug
+  build). Text over 64 kB (`WRAP_BYTES`) is drawn unwrapped, and the dialog's size line or the panel's status
+  says "long lines are not wrapped at this size": opening is back to 95–100 ms, and the first frame and a scroll
+  step are faster than before (1.5–2 ms and 4 ms against 12–15 and 19), since only the lines on screen are laid
+  out. Highlighting itself costs nothing measurable on the first paint (the kit parses up to 256 kB with a 2 ms
+  budget, then in the background).
+- **Not chosen.** A highlighter of Kerno's own over `StyledText` in the dialog: a second highlighter, and no
+  selection. Decorations over the JSON `null` literals instead of the `constant` token: more code for the same
+  look, and a token keeps the panel, the dialog and the editor alike.
+
 ## D-146 — A client that ends well before the end of its input fails the run (K79; 2026-11-25)
 
 K74's test `a_feed_that_fails_never_ends_the_child_s_input` failed on three CI runs (twice on Linux, once on

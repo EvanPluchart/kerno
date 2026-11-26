@@ -1248,6 +1248,50 @@ mod tests {
         assert!(failures.is_empty(), "below 4.5:1:\n{}", failures.join("\n"));
     }
 
+    /// K81: the value viewers (the dialog, the cell editor, the value panel)
+    /// draw on the editor's surface (`background`, the editor's own): there
+    /// every syntax colour, the text and the hex dump's two muted levels
+    /// read at 4.5:1; and a JSON `null` (the kit's `constant`, used by no SQL
+    /// capture) is drawn as the grid draws NULL, muted and italic.
+    #[test]
+    fn the_value_viewers_read_on_their_surface() {
+        let mut failures = Vec::new();
+        for theme in themes() {
+            let surface = theme.colors["background"].clone();
+            let mut texts = theme.syntax();
+            texts.insert("foreground".into(), theme.colors["foreground"].clone());
+            texts.insert(
+                "muted.foreground".into(),
+                theme.colors["muted.foreground"].clone(),
+            );
+            texts.insert(
+                "editor.line_number".into(),
+                theme.editor("editor.line_number"),
+            );
+            for (kind, color) in &texts {
+                let ratio = contrast(color, &surface);
+                if ratio < 4.5 {
+                    failures.push(format!("{}: {kind} is {ratio:.2}:1", theme.name));
+                }
+            }
+            // The unprintable bytes are a level dimmer than the gutter.
+            let (muted, dim) = (
+                contrast(&theme.colors["muted.foreground"], &surface),
+                contrast(&theme.editor("editor.line_number"), &surface),
+            );
+            assert!(dim < muted, "{}: {dim:.2} !< {muted:.2}", theme.name);
+            let null = &theme.highlight["syntax"]["constant"];
+            assert_eq!(
+                null["color"].as_str().unwrap().to_lowercase(),
+                theme.colors["muted.foreground"].to_lowercase(),
+                "{}",
+                theme.name
+            );
+            assert_eq!(null["font_style"], "italic", "{}", theme.name);
+        }
+        assert!(failures.is_empty(), "below 4.5:1:\n{}", failures.join("\n"));
+    }
+
     /// The marks of the editor's occurrences and of a grid's find (J6, J7):
     /// every syntax colour reads on the occurrence tint (4.5:1), the grid's
     /// text and links on the match tint (4.5:1); the frame stands out from

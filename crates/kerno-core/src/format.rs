@@ -434,6 +434,56 @@ pub fn hex_dump(bytes: &[u8]) -> String {
     out
 }
 
+/// What a part of [`hex_dump`]'s text is, for the viewers to draw it in a
+/// text level of the theme (K81): the bytes themselves are left plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HexPart {
+    /// The row's offset.
+    Offset,
+    /// The ASCII gutter, its bars included.
+    Gutter,
+    /// A byte of the gutter that has no printable character (drawn `.`,
+    /// as a real `.` byte is): dimmer than the gutter.
+    Unprintable,
+}
+
+/// The parts of `hex_dump(bytes)` to draw apart, as byte ranges of its text,
+/// in order and apart from each other: a row's gutter is cut around its
+/// unprintable runs.
+pub fn hex_parts(bytes: &[u8]) -> Vec<(std::ops::Range<usize>, HexPart)> {
+    // A row: 8 offset digits and 2 spaces, 16 bytes of 3 characters and
+    // 1 space between the halves, then a space, the bars and the gutter.
+    const GUTTER: usize = 60;
+    let mut parts: Vec<(std::ops::Range<usize>, HexPart)> =
+        Vec::with_capacity(bytes.len().div_ceil(16) * 3);
+    let mut start = 0;
+    for chunk in bytes.chunks(16) {
+        parts.push((start..start + 8, HexPart::Offset));
+        let bar = std::iter::once(HexPart::Gutter);
+        let kinds = bar
+            .clone()
+            .chain(chunk.iter().map(|&byte| {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    HexPart::Gutter
+                } else {
+                    HexPart::Unprintable
+                }
+            }))
+            .chain(bar);
+        let mut row_first = true;
+        for (column, kind) in kinds.enumerate() {
+            let at = start + GUTTER + column;
+            match parts.last_mut() {
+                Some((range, last)) if !row_first && *last == kind => range.end = at + 1,
+                _ => parts.push((at..at + 1, kind)),
+            }
+            row_first = false;
+        }
+        start += GUTTER + chunk.len() + 3;
+    }
+    parts
+}
+
 /// A size in bytes for people: `512 B`, `1.2 kB`, `3.4 MB`. Units are
 /// powers of 1024; one decimal below 10, none from 10 up.
 pub fn byte_size(bytes: u64) -> String {
@@ -1097,6 +1147,60 @@ mod tests {
         assert!(rows.iter().all(|row| row.find('|') == Some(60)));
         assert!(rows[18].starts_with("00000120  7f 7f"));
         assert!(rows[18].ends_with("|............|"));
+    }
+
+    /// K81: the offsets, the gutter and its unprintable bytes, where the
+    /// dump has them; a real `.` byte is printable.
+    #[test]
+    fn hex_parts_name_the_offsets_and_the_gutter_of_each_row() {
+        let bytes: Vec<u8> = b"A.\x00\x01B\x7fCDEFGHIJKL\x02".to_vec();
+        let dump = hex_dump(&bytes);
+        let parts = hex_parts(&bytes);
+        let text = |part: &(std::ops::Range<usize>, HexPart)| &dump[part.0.clone()];
+        let named: Vec<(&str, HexPart)> = parts.iter().map(|p| (text(p), p.1)).collect();
+        assert_eq!(
+            named,
+            [
+                ("00000000", HexPart::Offset),
+                ("|A.", HexPart::Gutter),
+                ("..", HexPart::Unprintable),
+                ("B", HexPart::Gutter),
+                (".", HexPart::Unprintable),
+                ("CDEFGHIJKL|", HexPart::Gutter),
+                ("00000010", HexPart::Offset),
+                ("|", HexPart::Gutter),
+                (".", HexPart::Unprintable),
+                ("|", HexPart::Gutter),
+            ]
+        );
+        // The parts follow each other without overlapping.
+        assert!(
+            parts
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start)
+        );
+        assert!(hex_parts(&[]).is_empty());
+        // Every range of a large dump falls inside its text.
+        let large: Vec<u8> = (0..=255u8).cycle().take(4099).collect();
+        let dump = hex_dump(&large);
+        let parts = hex_parts(&large);
+        assert!(
+            parts
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start)
+        );
+        for (range, part) in parts {
+            let shown = &dump[range.clone()];
+            let line = dump[..range.start].rfind('\n').map_or(0, |at| at + 1);
+            assert!(!shown.contains('\n'), "{shown:?}");
+            match part {
+                HexPart::Offset => assert_eq!((range.start - line, shown.len()), (0, 8)),
+                HexPart::Gutter => assert!(range.start - line >= 60, "{shown:?}"),
+                HexPart::Unprintable => {
+                    assert!(range.start - line > 60 && shown.chars().all(|c| c == '.'))
+                }
+            }
+        }
     }
 
     #[test]

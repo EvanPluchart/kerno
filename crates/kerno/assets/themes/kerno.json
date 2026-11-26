@@ -134,7 +134,8 @@
             "font_style": "italic"
           },
           "constant": {
-            "color": "#7445C7"
+            "color": "#505965",
+            "font_style": "italic"
           },
           "constructor": {
             "color": "#B8327F"
@@ -337,7 +338,8 @@
             "font_style": "italic"
           },
           "constant": {
-            "color": "#B79CF2"
+            "color": "#A3ADB9",
+            "font_style": "italic"
           },
           "constructor": {
             "color": "#EE8FC2"

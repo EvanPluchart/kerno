@@ -172,6 +172,8 @@ pub(super) struct Prepared {
     partial: bool,
     /// What time an integer that looks like a Unix time is.
     hint: Option<String>,
+    /// The parts of a hex dump to draw apart (K81).
+    hex: Vec<(std::ops::Range<usize>, kerno_core::format::HexPart)>,
 }
 
 /// Lays a value of `column` out as the viewer does: JSON indented, text
@@ -193,6 +195,7 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
             size: None,
             partial: false,
             hint,
+            hex: Vec::new(),
         };
     };
     let mut text = viewer::view_text(bytes, view, json.as_deref());
@@ -206,6 +209,10 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     };
+    let hex = match view {
+        View::Hex => viewer::hex_view_parts(bytes),
+        _ => Vec::new(),
+    };
     Prepared {
         view,
         text,
@@ -213,12 +220,13 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
         size: Some(bytes.len() as u64),
         partial,
         hint,
+        hex,
     }
 }
 
 /// The line beside the header: NULL, an empty value, or its size.
 pub(super) fn status(prepared: &Prepared) -> String {
-    match prepared.size {
+    let status = match prepared.size {
         None => "NULL".into(),
         Some(0) if prepared.view == View::Hex => "Empty: 0 bytes".into(),
         Some(0) => "Empty string".into(),
@@ -228,6 +236,10 @@ pub(super) fn status(prepared: &Prepared) -> String {
             byte_size(MAX_SHOWN_BYTES as u64)
         ),
         Some(size) => byte_size(size),
+    };
+    match viewer::wraps(prepared.view, prepared.text.len()) || prepared.view == View::Hex {
+        true => status,
+        false => format!("{status}; {}", viewer::NOT_WRAPPED),
     }
 }
 
@@ -252,6 +264,8 @@ pub struct ValuePanel {
     /// The widths of the grid and the panel.
     split: Entity<ResizableState>,
     editor: Entity<EditorState>,
+    /// The hex dump's offsets and gutter (K81).
+    marks: viewer::HexMarks,
     /// What the selection is, as last shown, and the grid's generation then.
     seen: Option<(Target, u64)>,
     target: Target,
@@ -281,12 +295,7 @@ pub struct ValuePanel {
 
 impl ValuePanel {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
-                .language("text")
-                .soft_wrap(true)
-                .line_number(false)
-        });
+        let editor = viewer::value_editor(window, cx);
         let split = cx.new(|_| ResizableState::default());
         let subscriptions = vec![
             cx.subscribe_in(
@@ -319,6 +328,7 @@ impl ValuePanel {
             table: None,
             split,
             editor,
+            marks: viewer::HexMarks::default(),
             seen: None,
             target: Target::Nothing,
             shown: None,
@@ -487,14 +497,11 @@ impl ValuePanel {
         let Some(shown) = self.shown.as_mut() else {
             return;
         };
-        let language = if prepared.view == View::Json {
-            "json"
-        } else {
-            "text"
-        };
+        let language = viewer::language(prepared.view);
+        let hex = prepared.hex.clone();
         let (text, wrap, null) = (
             prepared.text.clone(),
-            prepared.view != View::Hex,
+            viewer::wraps(prepared.view, prepared.text.len()),
             prepared.size.is_none(),
         );
         shown.prepared = Some(prepared);
@@ -503,9 +510,11 @@ impl ValuePanel {
                 editor.set_highlighter(language, cx);
             }
             editor.set_soft_wrap(wrap, window, cx);
+            editor.set_folding(language == "json", window, cx);
             editor.set_placeholder(if null { "NULL" } else { "" }, window, cx);
             editor.set_value(text, window, cx);
         });
+        self.marks.set(&self.editor, hex, cx);
         cx.notify();
     }
 
@@ -756,6 +765,8 @@ impl ValuePanel {
                 .bordered(false)
                 .appearance(false)
                 .readonly(!editable)
+                // A value is shown as stored: `<=>` stays three signs.
+                .font_features(gpui_kit::FontFeatures::disable_ligatures())
                 .into_any_element()
         };
         let read_only = match (&shown.editable, prepared.partial) {
@@ -874,6 +885,8 @@ impl ValuePanel {
 impl Render for ValuePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.fit(window, cx);
+        // The theme may have changed since the hex dump was marked.
+        self.marks.paint(&self.editor, cx);
         let theme = cx.theme();
         let (muted, warning, border) = (theme.muted_foreground, theme.warning, theme.border);
         let header = self.shown.as_ref().map(|shown| {
@@ -1065,6 +1078,20 @@ mod tests {
             binary.text
         );
         assert_eq!(binary.fetched, "");
+        // K81: its offset and gutter are marked, unprintable bytes apart;
+        // nothing else is.
+        use kerno_core::format::HexPart;
+        let parts: Vec<HexPart> = binary.hex.iter().map(|(_, part)| *part).collect();
+        assert_eq!(
+            parts,
+            [
+                HexPart::Offset,
+                HexPart::Gutter,
+                HexPart::Unprintable,
+                HexPart::Gutter
+            ]
+        );
+        assert!(json.hex.is_empty());
         // A Unix time says when.
         let time = prepare(&column(TypeKind::Integer), Some(b"1794619425"), true);
         assert_eq!(
@@ -1075,7 +1102,10 @@ mod tests {
         let long = "x".repeat(MAX_SHOWN_BYTES + 10);
         let cut = prepare(&column(TypeKind::Text), Some(long.as_bytes()), true);
         assert!(cut.partial && cut.text.len() == MAX_SHOWN_BYTES);
-        assert_eq!(status(&cut), "256 kB; the first 256 kB are shown");
+        assert_eq!(
+            status(&cut),
+            "256 kB; the first 256 kB are shown; long lines are not wrapped at this size"
+        );
         let bytes = vec![7u8; MAX_SHOWN_BYTES];
         assert!(prepare(&column(TypeKind::Binary), Some(&bytes), false).partial);
     }

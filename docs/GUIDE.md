@@ -604,6 +604,12 @@ keeps the panel on its cell while you move around the grid. With the panel shown
 on a cell puts the keyboard in the panel; with it hidden, Shift+Enter opens the value in a dialog as before, as
 does "View value" in a cell's menu.
 
+The panel and the dialogs draw a value with the theme's colours: JSON in the SQL editor's colours (strings,
+numbers, `true` and `false`; a `null` muted and slanted, as the grid shows NULL), a hex dump with its offsets and
+its text column muted and the bytes that have no character dimmer still. You can select part of the text and
+copy it (⌘C); Copy copies the whole value. A text longer than 64 kB is not wrapped, so that it opens at once: the
+line under it says so, and you scroll sideways. XML, HTML and other formats are shown as plain text.
+
 When the selected cell holds a foreign key (an order's `customer_id`, say), the panel shows under the value the
 row it points to, headed "customers, by customer_id": the columns a person reads first (a name, an email, a
 title, a code…), "Show all N columns" for the rest. "Choose columns…" picks the ones shown for that table, for

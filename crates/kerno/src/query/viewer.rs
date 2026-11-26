@@ -4,27 +4,44 @@
 //! (`super::value_panel`, K17) draws and saves values with the same
 //! functions.
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::{Editor, EditorState, TextDecoration, TextDecorationCollection};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    App, AppContext as _, ClipboardItem, Context, FontFeatures, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     TestSupportExt as _, Window, div, px,
 };
 use gpui_kit::{Entity, FocusHandle, Focusable as _};
-use kerno_core::format::{byte_size, compact_json, hex_dump, pretty_json, unix_time_hint};
+use kerno_core::format::{
+    HexPart, byte_size, compact_json, hex_dump, hex_parts, pretty_json, unix_time_hint,
+};
 use kerno_core::sql::CellValue;
 use kerno_core::{Column, TypeKind};
 
 /// The most a view draws: beyond it the text is cut and says so (the
 /// clipboard gets everything).
 pub(super) const MAX_SHOWN_BYTES: usize = 256 * 1024;
+
+/// The longest text the viewers wrap: wrapping lays every line out before
+/// the first paint, 85 ms more for 256 kB of JSON in a debug build (K81),
+/// where drawing it unwrapped lays out only the lines on screen.
+pub(super) const WRAP_BYTES: usize = 64 * 1024;
+
+/// Whether a view of `len` bytes of text wraps its long lines: never a hex
+/// dump, whose rows are as wide as each other.
+pub(super) fn wraps(view: View, len: usize) -> bool {
+    view != View::Hex && len <= WRAP_BYTES
+}
+
+/// What the viewers say of a text too long to wrap.
+pub(super) const NOT_WRAPPED: &str = "long lines are not wrapped at this size";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum View {
@@ -42,6 +59,101 @@ struct ValueViewer {
     views: Vec<View>,
     /// When the value is an integer that looks like a Unix time.
     hint: Option<String>,
+    /// The view's text, read only, highlighted as the SQL editor is (K81).
+    editor: Entity<EditorState>,
+    /// The hex view's offsets and gutter.
+    marks: HexMarks,
+    /// Only the start of the view is shown.
+    cut: bool,
+    /// The text is too long to wrap ([`WRAP_BYTES`]).
+    unwrapped: bool,
+}
+
+/// The language the kit's editor highlights a view in: JSON as the SQL
+/// editor's syntax colours draw it; text and hex plain (the hex view's
+/// parts are [`HexMarks`]).
+pub(super) fn language(view: View) -> &'static str {
+    match view {
+        View::Json => "json",
+        View::Text | View::Hex => "text",
+    }
+}
+
+/// The hex view's offsets and ASCII gutter in the theme's muted text level,
+/// its unprintable bytes a level dimmer (the editor's line numbers), the
+/// bytes as plain text (K81). Painted again when the theme changes.
+#[derive(Default)]
+pub(super) struct HexMarks {
+    collection: Option<TextDecorationCollection>,
+    parts: Vec<(Range<usize>, HexPart)>,
+    /// The colours the parts were painted in.
+    painted: Option<(Hsla, Hsla)>,
+}
+
+impl HexMarks {
+    /// Marks the parts of the dump `editor` holds (none: no marks).
+    pub(super) fn set(
+        &mut self,
+        editor: &Entity<EditorState>,
+        parts: Vec<(Range<usize>, HexPart)>,
+        cx: &mut App,
+    ) {
+        self.parts = parts;
+        self.painted = None;
+        self.paint(editor, cx);
+    }
+
+    /// Paints the parts in the current theme's colours, unless they are.
+    pub(super) fn paint(&mut self, editor: &Entity<EditorState>, cx: &mut App) {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let colors = (
+            muted,
+            theme
+                .highlight_theme
+                .style
+                .editor_line_number
+                .unwrap_or(muted),
+        );
+        if self.painted == Some(colors) {
+            return;
+        }
+        self.painted = Some(colors);
+        let decorations = self
+            .parts
+            .iter()
+            .map(|(range, part)| {
+                let color = match part {
+                    HexPart::Offset | HexPart::Gutter => colors.0,
+                    HexPart::Unprintable => colors.1,
+                };
+                let style = HighlightStyle {
+                    color: Some(color),
+                    ..Default::default()
+                };
+                TextDecoration::new(range.clone(), style)
+            })
+            .collect();
+        match &self.collection {
+            Some(collection) => collection.set(decorations, cx),
+            None => {
+                self.collection = Some(editor.update(cx, |editor, cx| {
+                    editor.create_decorations_collection(decorations, cx)
+                }))
+            }
+        }
+    }
+}
+
+/// A read-only editor for a value laid out at length (the viewer, the value
+/// panel): no line numbers, wrapped, highlighted by [`language`].
+pub(super) fn value_editor(window: &mut Window, cx: &mut App) -> Entity<EditorState> {
+    cx.new(|cx| {
+        EditorState::new(window, cx)
+            .language("text")
+            .soft_wrap(true)
+            .line_number(false)
+    })
 }
 
 /// Makes a value a pending change of the cell.
@@ -80,12 +192,17 @@ pub fn edit(
         fetched.clone()
     };
     let kind = column.kind;
-    let editor = cx.new(|cx| ValueEditor {
-        text: cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(14)
-                .default_value(shown.clone())
-        }),
+    let text = value_editor(window, cx);
+    text.update(cx, |text, cx| {
+        if json {
+            text.set_highlighter("json", cx);
+        }
+        text.set_soft_wrap(wraps(View::Text, shown.len()), window, cx);
+        text.set_folding(json, window, cx);
+        text.set_value(shown.clone(), window, cx);
+    });
+    let editor = cx.new(|_| ValueEditor {
+        text,
         shown,
         fetched,
         kind,
@@ -94,6 +211,8 @@ pub fn edit(
         save,
     });
     let text = editor.read(cx).text.clone();
+    #[cfg(test)]
+    opened::EDITOR.with(|last| *last.borrow_mut() = Some(text.clone()));
     let back = Some(back);
     window.open_dialog(cx, move |dialog, _, _| {
         let (editor, back) = (editor.clone(), back.clone());
@@ -139,7 +258,8 @@ pub fn give_back(focus: Option<FocusHandle>, window: &mut Window, cx: &mut App) 
 
 /// The value panel in edit mode.
 struct ValueEditor {
-    text: Entity<TextareaState>,
+    /// JSON highlighted as in the viewer (K81).
+    text: Entity<EditorState>,
     /// What the panel showed first.
     shown: String,
     /// What the cell holds.
@@ -233,9 +353,21 @@ impl Render for ValueEditor {
             .pt_1()
             .child(
                 div()
+                    .h(px(300.))
+                    .px_1()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
                     .font_family(theme.mono_font_family.clone())
                     .text_sm()
-                    .child(Textarea::new(&self.text)),
+                    .child(
+                        Editor::new(&self.text)
+                            .h_full()
+                            .bordered(false)
+                            .appearance(false)
+                            .font_features(FontFeatures::disable_ligatures()),
+                    ),
             )
             .children(hint_line(self.hint.clone(), cx))
             .children(self.problem.clone().map(|problem| {
@@ -312,13 +444,24 @@ fn show(
 ) {
     let title = SharedString::from(format!("{} · {}", column.name, column.type_name));
     let (views, json) = views_for(column, value);
-    let viewer = cx.new(|_| ValueViewer {
-        value: value.map(<[u8]>::to_vec),
-        json,
-        view: views.first().copied().unwrap_or(View::Text),
-        views,
-        hint: time_hint(column, value),
+    let editor = value_editor(window, cx);
+    let viewer = cx.new(|cx| {
+        let mut viewer = ValueViewer {
+            value: value.map(<[u8]>::to_vec),
+            json,
+            view: views.first().copied().unwrap_or(View::Text),
+            views,
+            hint: time_hint(column, value),
+            editor,
+            marks: HexMarks::default(),
+            cut: false,
+            unwrapped: false,
+        };
+        viewer.load(window, cx);
+        viewer
     });
+    #[cfg(test)]
+    opened::VIEWER.with(|last| *last.borrow_mut() = Some(viewer.downgrade()));
     window.open_dialog(cx, move |dialog, _, _| {
         let (viewer, back) = (viewer.clone(), back.clone());
         dialog
@@ -387,6 +530,11 @@ pub(super) fn size_line(size: Option<u64>, cut: bool) -> String {
     }
 }
 
+/// The parts of a hex view of `bytes` to mark: of the bytes it shows.
+pub(super) fn hex_view_parts(bytes: &[u8]) -> Vec<(Range<usize>, HexPart)> {
+    hex_parts(&bytes[..bytes.len().min(MAX_SHOWN_BYTES / 4)])
+}
+
 impl ValueViewer {
     /// What the current view shows, and what "Copy" copies.
     fn shown(&self) -> String {
@@ -395,32 +543,61 @@ impl ValueViewer {
             Some(bytes) => view_text(bytes, self.view, self.json.as_deref()),
         }
     }
+
+    /// Puts the current view in the editor: its start when it is long.
+    fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut text = self.shown();
+        self.cut = cut_at(&text).inspect(|end| text.truncate(*end)).is_some();
+        let (language, wrap) = (language(self.view), wraps(self.view, text.len()));
+        self.unwrapped = !wrap && self.view != View::Hex;
+        self.editor.update(cx, |editor, cx| {
+            if editor.language_name() != language {
+                editor.set_highlighter(language, cx);
+            }
+            editor.set_soft_wrap(wrap, window, cx);
+            editor.set_folding(self.view == View::Json, window, cx);
+            editor.set_value(text, window, cx);
+        });
+        let parts = match (&self.value, self.view) {
+            (Some(bytes), View::Hex) => hex_view_parts(bytes),
+            _ => Vec::new(),
+        };
+        self.marks.set(&self.editor, parts, cx);
+    }
 }
 
 impl Render for ValueViewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The theme may have changed while the dialog is open.
+        self.marks.paint(&self.editor, cx);
         let theme = cx.theme();
         let selected = self
             .views
             .iter()
             .position(|view| *view == self.view)
             .unwrap_or(0);
-        let text = self.shown();
-        let cut = cut_at(&text);
-        let body = match (&self.value, cut) {
-            (None, _) => div()
+        let cut = self.cut;
+        let body = match &self.value {
+            None => div()
+                .p_2()
                 .italic()
                 .text_color(theme.muted_foreground)
                 .child("NULL")
                 .into_any_element(),
-            (Some(_), Some(end)) => div()
-                .child(SharedString::from(text[..end].to_string()))
-                .into_any_element(),
-            (Some(_), None) => div()
-                .child(SharedString::from(text.clone()))
+            Some(_) => Editor::new(&self.editor)
+                .h_full()
+                .bordered(false)
+                .appearance(false)
+                .readonly(true)
+                // A value is shown as stored: `<=>` stays three signs.
+                .font_features(FontFeatures::disable_ligatures())
                 .into_any_element(),
         };
         let size = self.value.as_ref().map(|bytes| bytes.len() as u64);
+        let sizes = match self.unwrapped {
+            true => format!("{}; {NOT_WRAPPED}", size_line(size, cut)),
+            false => size_line(size, cut),
+        };
         v_flex()
             .gap_3()
             .pt_1()
@@ -429,9 +606,10 @@ impl Render for ValueViewer {
                     TabBar::new("value-views")
                         .underline()
                         .selected_index(selected)
-                        .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        .on_click(cx.listener(|this, index: &usize, window, cx| {
                             if let Some(view) = this.views.get(*index) {
                                 this.view = *view;
+                                this.load(window, cx);
                                 cx.notify();
                             }
                         }))
@@ -453,12 +631,13 @@ impl Render for ValueViewer {
                             .id("value-text")
                             .test_support()
                             .h(px(360.))
-                            .p_2()
-                            .overflow_y_scroll()
+                            .px_1()
                             .rounded(theme.radius)
                             .border_1()
                             .border_color(theme.border)
-                            .bg(theme.muted)
+                            // The editor's own surface: every syntax colour
+                            // is measured on it (`theme.rs`).
+                            .bg(theme.background)
                             .font_family(theme.mono_font_family.clone())
                             .text_sm()
                             .child(body),
@@ -470,9 +649,12 @@ impl Render for ValueViewer {
                     .justify_between()
                     .child(
                         div()
+                            .id("value-size")
+                            .test_support()
+                            .test_text(sizes.clone())
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(SharedString::from(size_line(size, cut.is_some()))),
+                            .child(SharedString::from(sizes)),
                     )
                     .child(
                         h_flex()
@@ -494,6 +676,55 @@ impl Render for ValueViewer {
                             ),
                     ),
             )
+    }
+}
+
+/// What the tests read of the last viewer and value editor opened.
+#[cfg(test)]
+pub(crate) mod opened {
+    use std::cell::RefCell;
+
+    use gpui_kit::{App, Entity, Hsla, WeakEntity};
+
+    use super::{EditorState, ValueViewer};
+
+    thread_local! {
+        pub(super) static VIEWER: RefCell<Option<WeakEntity<ValueViewer>>> =
+            const { RefCell::new(None) };
+        pub(super) static EDITOR: RefCell<Option<Entity<EditorState>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// The viewer's editor: its language, its text, the hex parts marked and
+    /// the colours they were painted in.
+    pub struct Shown {
+        pub language: String,
+        pub text: String,
+        pub marked: usize,
+        pub painted: Option<(Hsla, Hsla)>,
+    }
+
+    /// The last viewer opened, while it is.
+    pub fn viewer(cx: &App) -> Option<Shown> {
+        let viewer = VIEWER.with(|last| last.borrow().clone())?.upgrade()?;
+        let viewer = viewer.read(cx);
+        let editor = viewer.editor.read(cx);
+        Some(Shown {
+            language: editor.language_name().to_string(),
+            text: editor.value().to_string(),
+            marked: viewer.marks.parts.len(),
+            painted: viewer.marks.painted,
+        })
+    }
+
+    /// The last value editor's language and text.
+    pub fn editor(cx: &App) -> Option<(String, String)> {
+        let editor = EDITOR.with(|last| last.borrow().clone())?;
+        let editor = editor.read(cx);
+        Some((
+            editor.language_name().to_string(),
+            editor.value().to_string(),
+        ))
     }
 }
 

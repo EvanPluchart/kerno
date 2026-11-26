@@ -2092,3 +2092,13 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   `ui_tests/k75.rs`
   `every_refresh_keeps_the_tree_where_it_was` on PostgreSQL, MySQL and SQLite, seen failing under three
   mutations.
+
+## 2026-11-26 — K81: the value viewers drawn with the theme's colours
+
+- The owner's request of 2026-11-26: the viewer dialog and the value editor now lay a value out in the kit's
+  editor, as the value panel does, JSON highlighted with the SQL editor's syntax colours and its `null` drawn as
+  the grid draws NULL (the theme's `constant`); the hex view's offsets and gutter muted, its unprintable bytes
+  dimmer; every viewer on the editor's surface, no ligatures in a value; Copy, the size line, the Unix-time
+  hint and Escape as before; a text over 64 kB drawn unwrapped and said so (it opened 75 ms slower wrapped).
+  XML and HTML are not highlighted (no grammar in the lock). M12's K81, D-147; UI tests in `ui_tests/k81.rs`,
+  each seen failing without its part; headless captures light and dark looked at.
