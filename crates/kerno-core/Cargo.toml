@@ -61,6 +61,11 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # tree at the version locked, on the cipher aes-gcm uses.
 aes = "0.9.4"
 cbc = { version = "0.2.1", default-features = false, features = ["block-padding"] }
+# A time with a zone read in the computer's (K82, D-148), both already in the
+# tree at the version locked (through GPUI): the zone's offset at any date
+# from the system's rules (chrono's `Local`), and the zone's IANA name.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+iana-time-zone = "0.1.65"
 
 # The proof both ends of the running instance's pipe give on Windows (K64,
 # D-131): SHA-256, already in the tree at the version locked (the app's update

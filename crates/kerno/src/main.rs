@@ -750,6 +750,7 @@ fn menus() -> Vec<Menu> {
                 separator(),
                 command("toggle_selection_stats"),
                 command("toggle_value_panel"),
+                command("toggle_local_times"),
                 command("show_aggregate_panel"),
                 command("show_columns_panel"),
                 command("reset_table_layout"),

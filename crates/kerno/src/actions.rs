@@ -460,6 +460,9 @@ gpui_kit::actions!(
         ToggleSelectionStats,
         /// Shows the selected cell's value beside the grid, or hides it (K17).
         ToggleValuePanel,
+        /// Shows the times with a zone of a value in the computer's time
+        /// zone in the value viewers, or stops (K82).
+        ToggleLocalTimes,
         /// Shows count, sum, average, minimum and maximum of the selection.
         ShowAggregatePanel,
         /// Lists the columns of the result with their types and keys.
@@ -1645,6 +1648,22 @@ pub const COMMANDS: &[Command] = &[
             "value", "viewer", "json", "preview", "cell", "panels", "editor"
         ],
         ToggleValuePanel
+    ),
+    command!(
+        "toggle_local_times",
+        "Toggle Times in My Time Zone",
+        "Data",
+        [],
+        [
+            "time zone",
+            "timezone",
+            "timestamptz",
+            "local time",
+            "utc",
+            "offset",
+            "value viewer"
+        ],
+        ToggleLocalTimes
     ),
     // The editor binds its own search keys (Cmd+F, Cmd+Shift+F) while it has
     // the focus; these make the panel reachable from the palette and the menu.

@@ -2102,3 +2102,14 @@ workspace is green there: 2,101 passed, 3 ignored (the three measurements ignore
   hint and Escape as before; a text over 64 kB drawn unwrapped and said so (it opened 75 ms slower wrapped).
   XML and HTML are not highlighted (no grammar in the lock). M12's K81, D-147; UI tests in `ui_tests/k81.rs`,
   each seen failing without its part; headless captures light and dark looked at.
+
+## 2026-11-26 — K82: a time with a zone read in the computer's own
+
+- The owner's request of 2026-11-26: under a value that holds a time with a zone (a `timestamptz` or `timetz`
+  cell, a text, the strings of a JSON document, the Unix-time hint's integer), the viewer, the value editor and
+  the value panel offer "Times in my time zone (Europe/Paris)", off by default, kept in the settings and in the
+  palette; on, the time here with the offset of its own date (a line, or `path → time` for a document); the
+  value and Copy unchanged; nothing for a date and time without a zone (MySQL's `TIMESTAMP` included). The zone
+  is the computer's: its name from `iana-time-zone`, its rules from chrono's `Local` (both already in the lock,
+  now direct dependencies of `kerno-core`). M12's K82, D-148; tests in `local_time.rs` and `ui_tests/k82.rs`,
+  each seen failing without its part; headless captures light and dark looked at.

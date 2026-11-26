@@ -6,15 +6,17 @@
 
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use gpui_kit::base::TestTextExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, TextDecoration, TextDecorationCollection};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, ClipboardItem, Context, FontFeatures, HighlightStyle, Hsla,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, FontFeatures, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     TestSupportExt as _, Window, div, px,
 };
@@ -22,8 +24,11 @@ use gpui_kit::{Entity, FocusHandle, Focusable as _};
 use kerno_core::format::{
     HexPart, byte_size, compact_json, hex_dump, hex_parts, pretty_json, unix_time_hint,
 };
+use kerno_core::local_time::{self, Found, Zone, Zoned};
 use kerno_core::sql::CellValue;
 use kerno_core::{Column, TypeKind};
+
+use crate::state::AppState;
 
 /// The most a view draws: beyond it the text is cut and says so (the
 /// clipboard gets everything).
@@ -65,6 +70,8 @@ struct ValueViewer {
     marks: HexMarks,
     /// Only the start of the view is shown.
     cut: bool,
+    /// Its times with a zone (K82).
+    times: Times,
     /// The text is too long to wrap ([`WRAP_BYTES`]).
     unwrapped: bool,
 }
@@ -208,6 +215,7 @@ pub fn edit(
         kind,
         problem: None,
         hint: time_hint(column, value),
+        times: times_of(column, value),
         save,
     });
     let text = editor.read(cx).text.clone();
@@ -249,6 +257,165 @@ pub(super) fn hint_line(hint: Option<String>, cx: &App) -> Option<impl IntoEleme
     })
 }
 
+/// The computer's time zone, as the value viewers read it (K82): read once
+/// from the system unless this global is set (the tests set their own).
+pub struct LocalZone(pub Result<Zone, String>);
+
+impl gpui_kit::Global for LocalZone {}
+
+/// The zone the viewers show times in, or why there is none.
+fn local_zone(cx: &App) -> Result<Zone, String> {
+    static SYSTEM: OnceLock<Result<Zone, String>> = OnceLock::new();
+    match cx.try_global::<LocalZone>() {
+        Some(zone) => zone.0.clone(),
+        None => SYSTEM.get_or_init(Zone::system).clone(),
+    }
+}
+
+/// Turns the viewers' times in the computer's zone on or off (the switch,
+/// the palette).
+pub fn toggle_local_times(window: &mut Window, cx: &mut App) {
+    AppState::update_settings(cx, |settings| settings.local_times = !settings.local_times);
+    window.refresh();
+}
+
+/// How many times of a document are listed, and the largest document they
+/// are looked for in (on the UI thread in the dialog).
+const LISTED_TIMES: usize = 20;
+const TIME_SCAN_BYTES: usize = 1024 * 1024;
+
+/// What a value holds that the computer's time zone can say (K82).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) enum Times {
+    /// No time with a zone: a date and time without one has none.
+    #[default]
+    None,
+    /// The value is a time with a zone (`timestamptz`, `timetz`, a text).
+    One(Zoned),
+    /// An integer that looks like a Unix time (UTC).
+    Unix(Zoned),
+    /// A JSON document's times, at most [`LISTED_TIMES`], and their count.
+    Many(Vec<Found>, usize),
+}
+
+/// The times with a zone of a value of `column`. A MySQL `TIMESTAMP` is
+/// printed without its zone (in the session's): none, as any value whose
+/// text names no offset.
+pub(super) fn times_of(column: &Column, value: Option<&[u8]>) -> Times {
+    let Some(text) = value.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
+        return Times::None;
+    };
+    match column.kind {
+        TypeKind::Binary => return Times::None,
+        TypeKind::Integer => return local_time::unix_time(text).map_or(Times::None, Times::Unix),
+        _ => {}
+    }
+    if let Some(zoned) = local_time::parse(text) {
+        return Times::One(zoned);
+    }
+    let document = matches!(text.trim_start().as_bytes().first(), Some(b'{' | b'['));
+    if (column.kind == TypeKind::Json || document) && text.len() <= TIME_SCAN_BYTES {
+        let (found, count) = local_time::times_in_json(text, LISTED_TIMES);
+        if count > 0 {
+            return Times::Many(found, count);
+        }
+    }
+    Times::None
+}
+
+/// What the times of a value are in `zone`: one line for a value, a list
+/// for a document (`path → time`).
+pub(super) fn local_lines(times: &Times, zone: &Zone) -> Vec<String> {
+    let here = |zoned: &Zoned| {
+        let shown = zone.show_today(zoned)?;
+        Some(match zoned.has_date() {
+            true => shown,
+            false => format!("{shown}, today's offset"),
+        })
+    };
+    match times {
+        Times::None => Vec::new(),
+        Times::One(zoned) | Times::Unix(zoned) => here(zoned)
+            .map(|shown| format!("In {}: {shown}", zone.name()))
+            .into_iter()
+            .collect(),
+        Times::Many(found, count) => {
+            let mut lines = vec![format!("In {}:", zone.name())];
+            lines.extend(found.iter().filter_map(|found| {
+                let path = match found.path.as_str() {
+                    "" => "the value",
+                    path => path,
+                };
+                Some(format!("{path} \u{2192} {}", here(&found.zoned)?))
+            }));
+            if *count > found.len() {
+                lines.push(format!("and {} more", count - found.len()));
+            }
+            lines
+        }
+    }
+}
+
+/// The switch "Times in my time zone (Europe/Paris)" under a value that
+/// holds a time with a zone, and with it on what those times are here;
+/// nothing for any other value. Off when the zone cannot be read, with why.
+pub(super) fn local_times(times: &Times, cx: &App) -> Option<AnyElement> {
+    if *times == Times::None {
+        return None;
+    }
+    let zone = local_zone(cx);
+    let on = AppState::get(cx).settings.local_times;
+    let label = match &zone {
+        Ok(zone) => format!("Times in my time zone ({})", zone.name()),
+        Err(_) => "Times in my time zone".to_string(),
+    };
+    let lines = match (&zone, on) {
+        (Ok(zone), true) => local_lines(times, zone),
+        _ => Vec::new(),
+    };
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let why = zone.err().map(|why| {
+        let why = format!("Not available: {why}.");
+        div()
+            .id("value-local-zone-problem")
+            .test_support()
+            .test_text(why.clone())
+            .text_sm()
+            .text_color(muted)
+            .child(SharedString::from(why))
+    });
+    Some(
+        v_flex()
+            .gap_1()
+            .child(
+                Switch::new("value-local-times")
+                    .label(SharedString::from(label))
+                    .checked(on && why.is_none())
+                    .disabled(why.is_some())
+                    .on_click(|_, window, cx| toggle_local_times(window, cx)),
+            )
+            .children(why)
+            .when(!lines.is_empty(), |section| {
+                section.child(
+                    v_flex()
+                        .id("value-local-time")
+                        .test_support()
+                        .test_text(lines.join("\n"))
+                        .text_sm()
+                        .text_color(muted)
+                        .font_family(theme.mono_font_family.clone())
+                        .children(
+                            lines
+                                .into_iter()
+                                .map(|line| div().child(SharedString::from(line))),
+                        ),
+                )
+            })
+            .into_any_element(),
+    )
+}
+
 /// Once a dialog has closed, the keyboard goes back where it was.
 pub fn give_back(focus: Option<FocusHandle>, window: &mut Window, cx: &mut App) {
     if let Some(focus) = focus {
@@ -269,6 +436,8 @@ struct ValueEditor {
     problem: Option<String>,
     /// When the value is an integer that looks like a Unix time.
     hint: Option<String>,
+    /// Its times with a zone (K82).
+    times: Times,
     save: Save,
 }
 
@@ -370,6 +539,7 @@ impl Render for ValueEditor {
                     ),
             )
             .children(hint_line(self.hint.clone(), cx))
+            .children(local_times(&self.times, cx))
             .children(self.problem.clone().map(|problem| {
                 div()
                     .id("value-problem")
@@ -456,6 +626,7 @@ fn show(
             marks: HexMarks::default(),
             cut: false,
             unwrapped: false,
+            times: times_of(column, value),
         };
         viewer.load(window, cx);
         viewer
@@ -642,7 +813,8 @@ impl Render for ValueViewer {
                             .text_sm()
                             .child(body),
                     )
-                    .children(hint_line(self.hint.clone(), cx)),
+                    .children(hint_line(self.hint.clone(), cx))
+                    .children(local_times(&self.times, cx)),
             )
             .child(
                 h_flex()

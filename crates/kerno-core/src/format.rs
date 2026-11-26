@@ -510,17 +510,7 @@ pub fn byte_size(bytes: u64) -> String {
 /// from 2000-01-01 to 2100-01-01 (946684800 to 4102444800), or the same
 /// span in milliseconds or microseconds; `None` for anything else.
 pub fn unix_time_hint(text: &str) -> Option<String> {
-    const FIRST: i64 = 946_684_800;
-    const LAST: i64 = 4_102_444_800;
-    let text = text.trim();
-    let value: i64 = text.strip_prefix('+').unwrap_or(text).parse().ok()?;
-    let (unit, per_second, digits) = [
-        ("seconds", 1, 0),
-        ("milliseconds", 1_000, 3),
-        ("microseconds", 1_000_000, 6),
-    ]
-    .into_iter()
-    .find(|(_, per_second, _)| (FIRST * per_second..=LAST * per_second).contains(&value))?;
+    let (unit, value, per_second, digits) = unix_unit(text)?;
     let (seconds, fraction) = (value / per_second, value % per_second);
     let (days, time) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     let (year, month, day) = civil_from_days(days);
@@ -535,6 +525,31 @@ pub fn unix_time_hint(text: &str) -> Option<String> {
     }
     out.push_str(" UTC");
     Some(out)
+}
+
+/// The unit an integer that looks like a Unix time is counted in: its
+/// name, the integer, its units in a second and its fraction's digits.
+fn unix_unit(text: &str) -> Option<(&'static str, i64, i64, usize)> {
+    const FIRST: i64 = 946_684_800;
+    const LAST: i64 = 4_102_444_800;
+    let text = text.trim();
+    let value: i64 = text.strip_prefix('+').unwrap_or(text).parse().ok()?;
+    [
+        ("seconds", 1, 0),
+        ("milliseconds", 1_000, 3),
+        ("microseconds", 1_000_000, 6),
+    ]
+    .into_iter()
+    .find(|(_, per_second, _)| (FIRST * per_second..=LAST * per_second).contains(&value))
+    .map(|(unit, per_second, digits)| (unit, value, per_second, digits))
+}
+
+/// An integer [`unix_time_hint`] reads as a Unix time: its seconds, the
+/// nanoseconds after them and the digits of its fraction (K82).
+pub(crate) fn unix_parts(text: &str) -> Option<(i64, u32, usize)> {
+    let (_, value, per_second, digits) = unix_unit(text)?;
+    let nanos = (value % per_second) * (1_000_000_000 / per_second);
+    Some((value / per_second, nanos as u32, digits))
 }
 
 /// The proleptic Gregorian date `days` after 1970-01-01. Howard Hinnant's

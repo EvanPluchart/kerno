@@ -610,6 +610,14 @@ its text column muted and the bytes that have no character dimmer still. You can
 copy it (⌘C); Copy copies the whole value. A text longer than 64 kB is not wrapped, so that it opens at once: the
 line under it says so, and you scroll sideways. XML, HTML and other formats are shown as plain text.
 
+Under a value that holds a time with a time zone (a `timestamptz` cell, a text such as `2026-06-08T16:17:04Z`,
+the times inside a JSON document, or a number that reads as a Unix time), the panel and the dialogs offer "Times
+in my time zone", with your computer's zone in brackets. Turn it on to see each time as it is where you are, with
+the offset of that date (summer and winter differ): one line under a value, a list under a document. The value
+itself, and what Copy copies, do not change; Kerno remembers the switch, and "Toggle Times in My Time Zone" in the
+palette turns it on or off. A date and time without a zone (PostgreSQL's `timestamp`, MySQL's `DATETIME` and
+`TIMESTAMP`, which MySQL prints without its zone) gets no switch: Kerno cannot know which zone it was in.
+
 When the selected cell holds a foreign key (an order's `customer_id`, say), the panel shows under the value the
 row it points to, headed "customers, by customer_id": the columns a person reads first (a name, an email, a
 title, a code…), "Show all N columns" for the rest. "Choose columns…" picks the ones shown for that table, for

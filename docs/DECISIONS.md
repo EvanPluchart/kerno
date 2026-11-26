@@ -4457,6 +4457,49 @@ one that finds the user's files, its updates and the backup tools.
   runner); the start-failure page still says "Set HOME" when no data folder is found; the installer, the
   OpenSSH tunnel, Pageant, and a pass in the real app (ROADMAP, Windows).
 
+## D-148 — A time with a zone is read in the computer's zone, beside the value, never instead (K82; 2026-11-26)
+
+The owner asked to see a time in his own zone in the value viewer when the value has a zone.
+
+- **Only what names its offset.** A value counts when its text is a time with an offset or `Z` (`timestamptz`,
+  `timetz`, a text, a JSON string), or an integer the Unix-time hint reads (UTC). A date and time without an
+  offset has none, and nothing is offered: PostgreSQL's `timestamp`, MySQL's `DATETIME`, and MySQL's `TIMESTAMP`,
+  which the server stores in UTC but prints in the session's zone without it (Kerno sets no `time_zone` unless the
+  connection's options do, so that zone is the server's and the text cannot tell it). The type is not trusted:
+  `TypeKind::Time` is `time`, `timetz` and MySQL's `TIME` (a duration) at once; the text decides.
+- **Beside, never instead.** The stored text, the editor's text, Copy and the grid are unchanged. A switch under
+  the value, "Times in my time zone (Europe/Paris)", off by default, kept in the settings (`local_times`), also
+  in the palette and the Data menu; on, "In Europe/Paris: 2026-06-08 18:17:04.768895 +02:00" under a value, and
+  under a document a list `path → time` (20 at most, then "and N more"; documents up to 1 MB are looked into).
+  The switch shows only under a value that holds such a time: nowhere else would it mean anything. The kit's
+  editor has no inlay text, so a time inside a document is not annotated in place.
+- **The zone's rules, not today's offset.** Each instant takes the offset the zone gives at that instant (a June
+  and a December date in Paris: +02:00 and +01:00). A time of day alone has no date: it takes today's offset and
+  the line says "today's offset", as PostgreSQL itself does for `timetz`.
+- **Two crates made direct, none added.** `chrono` (feature `clock`, no defaults) for the offsets, through its
+  `Local` zone: the zone file's rules (TZif, with its rule for future years) on macOS and Linux, Windows' own rules
+  for the year there. `iana-time-zone` for the zone's name (`TZ` or the `/etc/localtime` link on macOS and Linux;
+  on Windows the system's zone mapped to its IANA name). Both were in `Cargo.lock` at these versions through GPUI;
+  `Cargo.lock` only gains the two names under `kerno-core`. The task allowed one; the name and the rules come from
+  different crates, and reading Windows' zone name without `iana-time-zone` is code of its own. If the name cannot
+  be read the switch is disabled and says why; chrono alone would fall back to UTC silently.
+- **chrono is unmaintained (RUSTSEC-2026-0543), by exception.** `deny.toml` fails an unmaintained crate only when
+  Kerno depends on it directly; chrono now is. The advisory names no safe upgrade; its alternatives (jiff,
+  `time`) are a new crate or have no zone rules. chrono is in every Kerno binary through GPUI already, and
+  `kerno-core` uses only `Local`'s offset at an instant: `deny.toml` ignores the advisory with this reason. When
+  GPUI drops chrono, K82 moves to jiff.
+- **How each system is read.** The offsets: chrono's `Local`, on macOS and Linux the zone file `TZ` names, else
+  `/etc/localtime` (TZif, its footer rule for years past its table); on Windows the system's zone rules for each
+  year. The name: `TZ` when it is set (Unix; chrono reads it too, so the name and the rules agree), else
+  `iana-time-zone`: macOS' system zone (`CFTimeZoneCopySystem`), Linux's `/etc/localtime` link (then
+  `/etc/timezone`), Windows' zone as an IANA name (`Calendar.GetTimeZone`). On a CI runner the UI tests give their
+  own zone (`LocalZone`), so they do not depend on the runner's, usually UTC.
+- **The parser is Kerno's.** RFC 3339 has no `+00`, no time alone and no `+00:09:21`, PostgreSQL's spellings, so `local_time::parse` reads exactly what is listed in M12's K82 and refuses the rest
+  without panicking (`24:00`, ` BC`, `infinity`, out-of-range fields; a leap second is kept as `:60`). Year 0 and
+  year 9999 shown across a day keep chrono's ISO spelling (`-0001`, `+10000`).
+- **Not chosen.** Converting in the session (`SET TIME ZONE`): it changes what every query returns, and Copy would
+  copy something else. A setting to choose another zone: not asked here.
+
 ## D-147 — The value viewers are the kit's editor, in the SQL editor's colours (K81; 2026-11-26)
 
 The owner asked for the data viewers to be coloured with the theme. The value panel (K17) already laid a value

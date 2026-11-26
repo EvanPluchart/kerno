@@ -7064,6 +7064,9 @@ impl Workspace {
         .on_action(cx.listener(|_, _: &actions::ToggleValuePanel, window, cx| {
             crate::query::value_panel::toggle(window, cx)
         }))
+        .on_action(cx.listener(|_, _: &actions::ToggleLocalTimes, window, cx| {
+            crate::query::viewer::toggle_local_times(window, cx)
+        }))
         .on_action(
             cx.listener(|this, _: &actions::ShowAggregatePanel, window, cx| {
                 this.on_grid(GridAction::Panel(Panel::Aggregate), window, cx)

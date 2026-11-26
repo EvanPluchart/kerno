@@ -174,6 +174,8 @@ pub(super) struct Prepared {
     hint: Option<String>,
     /// The parts of a hex dump to draw apart (K81).
     hex: Vec<(std::ops::Range<usize>, kerno_core::format::HexPart)>,
+    /// Its times with a zone (K82).
+    times: viewer::Times,
 }
 
 /// Lays a value of `column` out as the viewer does: JSON indented, text
@@ -187,6 +189,7 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
         view = View::Text;
     }
     let hint = viewer::time_hint(column, value);
+    let times = viewer::times_of(column, value);
     let Some(bytes) = value else {
         return Prepared {
             view: View::Text,
@@ -196,6 +199,7 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
             partial: false,
             hint,
             hex: Vec::new(),
+            times,
         };
     };
     let mut text = viewer::view_text(bytes, view, json.as_deref());
@@ -221,6 +225,7 @@ pub(super) fn prepare(column: &Column, value: Option<&[u8]>, editable: bool) -> 
         partial,
         hint,
         hex,
+        times,
     }
 }
 
@@ -794,6 +799,10 @@ impl ValuePanel {
             .children(
                 viewer::hint_line(prepared.hint.clone(), cx)
                     .map(|hint| div().px_3().pt_1().child(hint)),
+            )
+            .children(
+                viewer::local_times(&prepared.times, cx)
+                    .map(|times| div().px_3().pt_1().child(times)),
             )
             .children(self.problem.clone().map(|problem| {
                 div()

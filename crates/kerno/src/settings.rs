@@ -119,6 +119,9 @@ pub struct Settings {
     pub null_text: String,
     /// Timestamps with a time zone show their offset.
     pub show_time_zone: bool,
+    /// The value viewers say what each time with a zone of a value is in the
+    /// computer's time zone (K82): off until the user turns it on.
+    pub local_times: bool,
     /// The schema tree selects the table of the tab being activated.
     pub link_with_editor: bool,
     /// The footer of a grid shows the figures of the selected cells.
@@ -259,6 +262,7 @@ impl Default for Settings {
             vim_mode: false,
             null_text: "NULL".to_string(),
             show_time_zone: true,
+            local_times: false,
             link_with_editor: false,
             selection_stats: true,
             hide_idle_sessions: false,
@@ -465,6 +469,7 @@ mod tests {
             vim_mode: true,
             null_text: "∅".to_string(),
             show_time_zone: false,
+            local_times: true,
             link_with_editor: true,
             selection_stats: false,
             hide_idle_sessions: true,

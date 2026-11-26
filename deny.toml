@@ -14,8 +14,15 @@ yanked = "warn"
 # Security advisories always fail the check. "Unmaintained" notices fail it
 # only for crates Kerno depends on directly: the ones reported today (paste,
 # instant, ttf-parser, rustybuzz, zvariant, zbus_names) come in through GPUI
-# and gpui-component and are theirs to replace.
+# and gpui-component and are theirs to replace. One exception, chrono, direct
+# since K82 (D-148): see `ignore`.
 unmaintained = "workspace"
+ignore = [
+    # chrono is unmaintained, with no safe upgrade. GPUI builds it into Kerno
+    # anyway; kerno-core uses only its `Local` offsets (a time with a zone read
+    # in the computer's, K82, D-148). To jiff once GPUI drops chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono's Local offsets, already in GPUI's tree (K82, D-148)" },
+]
 
 [licenses]
 version = 2
